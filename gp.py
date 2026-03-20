@@ -1,14 +1,22 @@
 """
 Tree-based genetic programming engine.
 
-Programs are expression trees that compute f(input_grid, r, c) → color
-for each cell (r, c) of the output grid. All primitives are truly atomic:
+Programs are expression trees that compute f(grid, r, c) → color for each
+cell (r, c) of the output grid, optionally applied for multiple passes.
+
+All primitives are truly atomic:
 
   Position:    r, c, max_r, max_c     (output coordinates and dimensions)
-  Perception:  get(row, col)           (read input grid at computed position)
+  Perception:  get(row, col)           (read CURRENT grid — changes each pass)
+               inp(row, col)           (read ORIGINAL input — constant across passes)
   Constants:   0–9                     (ARC color values)
   Arithmetic:  add, sub, mod           (coordinate math)
   Logic:       eq, gt, if              (comparison and branching)
+
+Multi-pass: when passes > 1, the tree is applied repeatedly. Each pass reads
+its own output from the previous pass via `get`, while `inp` always reads the
+original input. This enables information propagation (cellular automata),
+flood-fill, and iterative refinement — all from the same atomic primitives.
 """
 
 import numpy as np
@@ -19,45 +27,41 @@ import numpy as np
 NUM_COLORS = 10                 # ARC uses colors 0–9
 NUM_TERMINALS = 4 + NUM_COLORS  # r, c, max_r, max_c + one per color
 MAX_TREE_DEPTH = 7              # limits composition depth; 7 allows ~128 nodes
+MAX_PASSES = 5                  # maximum multi-pass iterations
 
 # Tree generation probabilities
 # P_TERMINAL ≈ 1/(1+mean_arity) keeps expected tree size finite.
 # Mean arity across our ops is ~2.1, so 1/3.1 ≈ 0.32. We use 0.35.
 P_TERMINAL = 0.35
 
-# Safety: max node evaluations = 2^(MAX_TREE_DEPTH+1) with headroom for library expansion
+# Safety: max node evaluations per pass = 2^(MAX_TREE_DEPTH+1)
 MAX_EVAL_NODES = 2 ** (MAX_TREE_DEPTH + 1)
 
 # Tournament: k=4 gives ~75% chance of selecting the best quartile.
-# Standard range is 2–7; higher = more selection pressure.
 TOURNAMENT_K = 4
 
-# Mutation operator weights (relative, not probabilities — they get normalized).
-# Subtree mutation is most exploratory, point mutation is most conservative,
-# hoist simplifies. Weights roughly follow the "big-medium-small" mutation spectrum.
+# Mutation operator weights (relative, normalized internally).
 MUTATE_WEIGHTS = {"subtree": 5, "point": 3, "hoist": 2}
 _MUTATE_TOTAL = sum(MUTATE_WEIGHTS.values())
 
 
 # ── Tree structure ───────────────────────────────────────────────────
 # A node is a tuple: (op, child1, child2, ...)
-# Terminals have no children: ("r",), ("c",), ("max_r",), ("max_c",),
-#   ("const", v), ("lib", name)
-# Functions have children per ARITY:
-ARITY = {"add": 2, "sub": 2, "mod": 2, "eq": 2, "gt": 2, "get": 2, "if": 3}
+# Terminals: ("r",), ("c",), ("max_r",), ("max_c",), ("const", v), ("lib", name)
+# Functions:
+ARITY = {
+    "add": 2, "sub": 2, "mod": 2,    # arithmetic
+    "eq": 2, "gt": 2,                 # comparison
+    "get": 2,                          # read current grid (changes each pass)
+    "inp": 2,                          # read original input (constant across passes)
+    "if": 3,                           # conditional
+}
 
 
 def random_tree(max_depth=4, depth=0, library=None):
-    """Generate a random expression tree.
-
-    Terminal probability increases with depth so trees stay bounded.
-    Library entries are used as terminals proportionally to library size
-    (more entries → higher chance one is useful).
-    """
+    """Generate a random expression tree."""
     p_term = P_TERMINAL if depth < max_depth - 1 else 1.0
     if depth >= max_depth or np.random.random() < p_term:
-        # Use library entry with probability proportional to library fraction
-        # of total vocabulary: lib_size / (lib_size + NUM_TERMINALS)
         if library:
             lib_frac = len(library) / (len(library) + NUM_TERMINALS)
             if np.random.random() < lib_frac:
@@ -122,21 +126,11 @@ def replace(tree, path, new):
 
 # ── Evaluation ───────────────────────────────────────────────────────
 
-def evaluate(tree, input_grid, out_shape=None, library=None):
-    """Evaluate tree for every cell of the output grid.
-
-    Args:
-        tree: expression tree
-        input_grid: 2D list or array (the input)
-        out_shape: (rows, cols) of output; defaults to input shape
-        library: dict mapping names to subtrees
-
-    Returns:
-        2D int array (values 0–9), or None on error.
-    """
-    g = np.asarray(input_grid)
-    in_r, in_c = g.shape
-    o_r, o_c = out_shape if out_shape is not None else g.shape
+def _evaluate_once(tree, g_current, g_original, out_shape, library):
+    """Evaluate tree once for all output cells. Returns 2D int array or None."""
+    cur_r, cur_c = g_current.shape
+    orig_r, orig_c = g_original.shape
+    o_r, o_c = out_shape
 
     r_arr = np.broadcast_to(np.arange(o_r)[:, None], (o_r, o_c))
     c_arr = np.broadcast_to(np.arange(o_c)[None, :], (o_r, o_c))
@@ -166,9 +160,13 @@ def evaluate(tree, input_grid, out_shape=None, library=None):
         if op == "eq": return (a == b).astype(np.int64)
         if op == "gt": return (a > b).astype(np.int64)
         if op == "get":
-            ri = np.clip(np.broadcast_to(np.asarray(a), (o_r, o_c)), 0, in_r - 1).astype(int)
-            ci = np.clip(np.broadcast_to(np.asarray(b), (o_r, o_c)), 0, in_c - 1).astype(int)
-            return g[ri, ci]
+            ri = np.clip(np.broadcast_to(np.asarray(a), (o_r, o_c)), 0, cur_r - 1).astype(int)
+            ci = np.clip(np.broadcast_to(np.asarray(b), (o_r, o_c)), 0, cur_c - 1).astype(int)
+            return g_current[ri, ci]
+        if op == "inp":
+            ri = np.clip(np.broadcast_to(np.asarray(a), (o_r, o_c)), 0, orig_r - 1).astype(int)
+            ci = np.clip(np.broadcast_to(np.asarray(b), (o_r, o_c)), 0, orig_c - 1).astype(int)
+            return g_original[ri, ci]
         if op == "if":
             return np.where(a != 0, b, _eval(node[3]))
         return np.int64(0)
@@ -179,6 +177,28 @@ def evaluate(tree, input_grid, out_shape=None, library=None):
         return np.clip(out, 0, 9).astype(int)
     except Exception:
         return None
+
+
+def evaluate(tree, input_grid, out_shape=None, library=None, passes=1):
+    """Evaluate tree, optionally applying it for multiple passes.
+
+    Pass 1: get reads from input, inp reads from input (equivalent).
+    Pass 2+: get reads from previous pass output, inp reads from original input.
+
+    This enables cellular-automata-like computation: local rules that through
+    iteration produce global behavior (flood fill, object detection, etc.).
+    """
+    g_original = np.asarray(input_grid)
+    o_shape = out_shape if out_shape is not None else g_original.shape
+    g_current = g_original
+
+    for _ in range(passes):
+        result = _evaluate_once(tree, g_current, g_original, o_shape, library)
+        if result is None:
+            return None
+        g_current = result
+
+    return g_current
 
 
 # ── GP operators ─────────────────────────────────────────────────────
@@ -193,10 +213,7 @@ def crossover(p1, p2):
 
 
 def mutate(tree, library=None):
-    """Apply one random mutation: subtree, point, or hoist.
-
-    Mutation type chosen by weighted random selection (see MUTATE_WEIGHTS).
-    """
+    """Apply one random mutation: subtree, point, or hoist."""
     r = np.random.random() * _MUTATE_TOTAL
     subs = subtrees(tree)
     path, node = subs[np.random.randint(len(subs))]

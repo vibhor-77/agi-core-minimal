@@ -2,9 +2,12 @@
 Evolutionary program synthesis for ARC-AGI.
 
 Uses genetic programming to evolve cell-level programs from atomic primitives.
-Programs compute f(grid, r, c) → color for each output cell. Evolution discovers
-compositions like flip, rotate, and recolor. Useful subtrees are abstracted into
-a reusable library, enabling compounding across tasks.
+Programs compute f(grid, r, c) → color for each output cell, optionally applied
+for multiple passes (enabling cellular-automata-like information propagation).
+
+Evolution discovers compositions like flip, rotate, recolor, flood-fill, and
+conditional logic. Useful subtrees are abstracted into a reusable library,
+enabling compounding across tasks.
 """
 
 import json, sys, os, numpy as np
@@ -19,19 +22,16 @@ GENERATIONS_BASE = 15           # generations at fitness=0; doubles at fitness=1
 ELITE_FRACTION = 5              # keep top 1/N of population as elite
 
 # Fitness function
-# Changed-cell weight: derived from typical ARC tasks where ~10-20% of cells
-# change. Weight of 3 means fixing a changed cell is worth 3 unchanged cells,
-# so a program must get ~75% of changed cells right to beat identity.
-CHANGED_CELL_WEIGHT = 3.0
-# Parsimony: penalty per node. Set so a 50-node tree loses ~0.1 fitness,
-# enough to prefer simpler programs among near-equals but not enough to
-# prevent finding complex solutions.
-PARSIMONY_PENALTY = 0.002
+CHANGED_CELL_WEIGHT = 3.0       # changed cells weighted higher to beat identity plateau
+PARSIMONY_PENALTY = 0.002       # fitness cost per tree node (prefer simpler programs)
 
 # Abstraction: promote subtrees shared across solvers
 MIN_SUBTREE_SIZE = 3            # below this, subtrees are too trivial to abstract
 MAX_SUBTREE_SIZE = 20           # above this, subtrees are too specific to reuse
 MIN_SHARED_SOLVERS = 2          # must appear in at least this many solver programs
+
+# Multi-pass: fraction of population initialized with passes > 1
+MULTIPASS_FRACTION = 0.2        # 20% of population starts with 2-3 passes
 
 
 # ── Data ─────────────────────────────────────────────────────────────
@@ -53,21 +53,12 @@ def load(path):
 IDENTITY = ("get", ("r",), ("c",))
 
 
-def fitness(tree, examples, library=None):
-    """Weighted cell accuracy with parsimony pressure.
-
-    Changed cells are weighted higher than unchanged cells so that
-    evolution is rewarded for fixing the cells that actually differ
-    between input and output, rather than just preserving the background.
-
-    For different-size tasks (where input and output shapes differ),
-    all output cells are treated as "changed" since there is no
-    cell-to-cell correspondence with the input.
-    """
+def fitness(tree, examples, library=None, passes=1):
+    """Weighted cell accuracy with parsimony pressure."""
     total = 0.0
     for inp, out in examples:
         out_a = np.asarray(out)
-        got = gp.evaluate(tree, inp, out_a.shape, library)
+        got = gp.evaluate(tree, inp, out_a.shape, library, passes=passes)
         if got is None or got.shape != out_a.shape:
             continue
         inp_a = np.asarray(inp)
@@ -87,29 +78,24 @@ def fitness(tree, examples, library=None):
     return max(0.0, accuracy - PARSIMONY_PENALTY * gp.size(tree))
 
 
-def solves(tree, examples, library=None):
+def solves(tree, examples, library=None, passes=1):
     """Check if tree produces exact output for all examples."""
     for inp, out in examples:
         out_a = np.asarray(out)
-        got = gp.evaluate(tree, inp, out_a.shape, library)
+        got = gp.evaluate(tree, inp, out_a.shape, library, passes=passes)
         if got is None or not np.array_equal(got, out_a):
             return False
     return True
 
 
-def simplify(tree, examples, library=None):
-    """Greedily replace subtrees with simpler equivalents.
-
-    Tries replacing each non-terminal subtree (largest first) with a
-    set of canonical simple programs. If the simplified version still
-    solves all examples, keep it. This removes overfitting junk and
-    improves generalization.
-    """
-    if not solves(tree, examples, library):
+def simplify(tree, examples, library=None, passes=1):
+    """Greedily replace subtrees with simpler equivalents."""
+    if not solves(tree, examples, library, passes):
         return tree
     R, C = ("r",), ("c",)
     replacements = [
         R, C, ("max_r",), ("max_c",), IDENTITY, ("get", C, R),
+        ("inp", ("r",), ("c",)),                                   # inp(r,c)
         ("sub", ("sub", ("max_r",), ("const", 1)), R),
         ("sub", ("sub", ("max_c",), ("const", 1)), C),
     ] + [("const", i) for i in range(gp.NUM_COLORS)]
@@ -125,7 +111,7 @@ def simplify(tree, examples, library=None):
                 if gp.size(repl) >= gp.size(sub):
                     continue
                 candidate = gp.replace(tree, path, repl)
-                if solves(candidate, examples, library):
+                if solves(candidate, examples, library, passes):
                     tree = candidate
                     changed = True
                     break
@@ -137,137 +123,174 @@ def simplify(tree, examples, library=None):
 # ── Seeds ────────────────────────────────────────────────────────────
 
 def make_seeds():
-    """Generate initial program templates from the atomic primitives.
+    """Generate initial program templates expressed from atomic primitives.
 
-    These are programs that the system COULD discover through evolution,
-    expressed using only the atomic operations. Including them as seeds
-    ensures the system doesn't waste generations rediscovering well-known
-    geometric transforms, and instead spends its budget on novel compositions.
-
+    Returns list of (tree, passes) tuples.
     Categories:
       - Geometric remaps (7): identity, transpose, flips, rotations
       - Shifts (8): circular shifts by 1-4 in each axis
       - Recolors (90): if cell==X, change to Y (all color pairs)
+      - Multi-pass templates: neighbor-based rules for iterative computation
     """
     R, C, MR, MC, ONE = ("r",), ("c",), ("max_r",), ("max_c",), ("const", 1)
-    flip_r = ("sub", ("sub", MR, ONE), R)   # max_r - 1 - r
-    flip_c = ("sub", ("sub", MC, ONE), C)   # max_c - 1 - c
-    seeds = [
-        IDENTITY,                                           # identity
+    flip_r = ("sub", ("sub", MR, ONE), R)
+    flip_c = ("sub", ("sub", MC, ONE), C)
+    seeds = []
+
+    # Single-pass geometric transforms
+    for tree in [
+        IDENTITY,
         ("get", C, R),                                      # transpose
-        ("get", flip_r, C),                                 # flip vertical
-        ("get", R, flip_c),                                 # flip horizontal
-        ("get", flip_r, flip_c),                            # rotate 180
-        ("get", C, flip_r),                                 # rotate cw
-        ("get", flip_c, R),                                 # rotate ccw
-    ]
+        ("get", flip_r, C),                                  # flip vertical
+        ("get", R, flip_c),                                  # flip horizontal
+        ("get", flip_r, flip_c),                             # rotate 180
+        ("get", C, flip_r),                                  # rotate cw
+        ("get", flip_c, R),                                  # rotate ccw
+    ]:
+        seeds.append((tree, 1))
+
+    # Shifts by 1-4
     for k in range(1, 5):
         K = ("const", k)
-        seeds.append(("get", ("mod", ("add", R, K), MR), C))   # shift down by k
-        seeds.append(("get", R, ("mod", ("add", C, K), MC)))   # shift right by k
+        seeds.append((("get", ("mod", ("add", R, K), MR), C), 1))
+        seeds.append((("get", R, ("mod", ("add", C, K), MC)), 1))
+
+    # Recolors: if cell == x, change to y
     for x in range(gp.NUM_COLORS):
         for y in range(gp.NUM_COLORS):
             if x != y:
-                seeds.append(("if", ("eq", ("get", R, C), ("const", x)),
-                              ("const", y), ("get", R, C)))
+                seeds.append((
+                    ("if", ("eq", ("get", R, C), ("const", x)),
+                     ("const", y), ("get", R, C)),
+                    1
+                ))
+
+    # Multi-pass templates: neighbor-aware rules (2-3 passes)
+    # "If any neighbor has color X, become X" — flood-fill-like
+    for color in range(1, 5):
+        CV = ("const", color)
+        neighbor_check = ("if",
+            ("eq", ("get", ("add", R, ONE), C), CV), CV,
+            ("if", ("eq", ("get", ("sub", R, ONE), C), CV), CV,
+             ("if", ("eq", ("get", R, ("add", C, ONE)), CV), CV,
+              ("if", ("eq", ("get", R, ("sub", C, ONE)), CV), CV,
+               ("get", R, C)))))
+        seeds.append((neighbor_check, 2))
+        seeds.append((neighbor_check, 3))
+
+    # "Copy non-zero from input, propagate via neighbors" (2 passes)
+    propagate = ("if", ("inp", R, C), ("inp", R, C),
+                 ("if", ("get", ("add", R, ONE), C), ("get", ("add", R, ONE), C),
+                  ("if", ("get", R, ("add", C, ONE)), ("get", R, ("add", C, ONE)),
+                   ("get", R, C))))
+    seeds.append((propagate, 2))
+    seeds.append((propagate, 3))
+
     return seeds
 
 
 # ── Search ───────────────────────────────────────────────────────────
 
 def search_budget(prev_fitness):
-    """Compute search effort that scales continuously with fitness.
-
-    Higher fitness = closer to solving = more value in additional effort.
-    Budget scales linearly: fitness=0 gets base, fitness=1 gets 2x base.
-    """
+    """Search effort scales continuously with fitness."""
     scale = 1.0 + prev_fitness
     return int(POP_SIZE_BASE * scale), int(GENERATIONS_BASE * scale)
 
 
-def search(examples, seed=None, library=None, pop_size=None, gens=None):
-    """Evolve a program for a single task.
+def search(examples, seed=None, seed_passes=1, library=None,
+           pop_size=None, gens=None):
+    """Evolve a (tree, passes) program for a single task.
 
-    Starts from seed templates + mutations, evolves via tournament selection,
-    crossover, and mutation. Stops early when improvement rate drops below
-    threshold. Returns (best_tree, best_fitness).
+    Population contains programs with varying pass counts. Evolution jointly
+    optimizes the tree structure and number of passes.
+    Returns (best_tree, best_passes, best_fitness).
     """
     if pop_size is None or gens is None:
         pop_size, gens = POP_SIZE_BASE, GENERATIONS_BASE
 
-    seeds = make_seeds()
-    pop_size = max(pop_size, len(seeds) + 20)
-    pop = list(seeds)
+    all_seeds = make_seeds()
+    pop_size = max(pop_size, len(all_seeds) + 20)
+
+    # Initialize population: seeds + mutations + random (with varied passes)
+    pop = list(all_seeds)  # (tree, passes) tuples
 
     n_mutants = pop_size // ELITE_FRACTION
     if seed is not None and seed != IDENTITY:
-        pop.append(seed)
+        pop.append((seed, seed_passes))
         for _ in range(n_mutants):
-            pop.append(gp.mutate(seed, library=library))
+            pop.append((gp.mutate(seed, library=library), seed_passes))
     for _ in range(n_mutants):
-        pop.append(gp.mutate(IDENTITY, library=library))
+        pop.append((gp.mutate(IDENTITY, library=library), 1))
+
     while len(pop) < pop_size:
-        pop.append(gp.random_tree(max_depth=4, library=library))
+        passes = np.random.choice([1, 1, 1, 1, 2, 2, 3])  # bias toward 1-pass
+        pop.append((gp.random_tree(max_depth=4, library=library), passes))
 
-    best_t, best_f = IDENTITY, fitness(IDENTITY, examples, library)
+    # Track best
+    best_t, best_p, best_f = IDENTITY, 1, fitness(IDENTITY, examples, library, 1)
     if seed is not None:
-        sf = fitness(seed, examples, library)
+        sf = fitness(seed, examples, library, seed_passes)
         if sf > best_f:
-            best_t, best_f = seed, sf
+            best_t, best_p, best_f = seed, seed_passes, sf
 
-    # Patience scales with fitness: high fitness = worth trying longer.
-    # At fitness=0: patience=3. At fitness=0.9: patience=8.
     patience = int(3 + best_f * 6)
     stale = 0
     for gen in range(gens):
-        fits = [fitness(p, examples, library) for p in pop]
+        fits = [fitness(t, examples, library, p) for t, p in pop]
         improved = False
-        for p, f in zip(pop, fits):
+        for (t, p), f in zip(pop, fits):
             if f > best_f:
-                best_t, best_f = p, f
+                best_t, best_p, best_f = t, p, f
                 improved = True
         if improved:
             stale = 0
             patience = int(3 + best_f * 6)
         else:
             stale += 1
-        if solves(best_t, examples, library):
-            return simplify(best_t, examples, library), 1.0
+        if solves(best_t, examples, library, best_p):
+            return simplify(best_t, examples, library, best_p), best_p, 1.0
         if stale > patience:
             break
+
         # Next generation
         ranked = sorted(zip(fits, pop), reverse=True)
-        elite = [p for _, p in ranked[:pop_size // ELITE_FRACTION]]
-        new_pop = list(elite) + [IDENTITY, best_t]
+        elite = [(t, p) for _, (t, p) in ranked[:pop_size // ELITE_FRACTION]]
+        new_pop = list(elite) + [(IDENTITY, 1), (best_t, best_p)]
+
         n_best_mutants = pop_size // (ELITE_FRACTION * 2)
         for _ in range(n_best_mutants):
-            new_pop.append(gp.mutate(best_t, library=library))
+            new_pop.append((gp.mutate(best_t, library=library), best_p))
+
         while len(new_pop) < pop_size:
-            p1 = gp.tournament(pop, fits)
-            p2 = gp.tournament(pop, fits)
-            child = gp.crossover(p1, p2)
-            # Mutation probability after crossover: always mutate.
-            # Crossover alone is too conservative for this search space.
-            child = gp.mutate(child, library=library)
-            new_pop.append(child)
+            # Tournament selection by index (population items are tuples)
+            k = min(gp.TOURNAMENT_K, len(pop))
+            idx1 = max(np.random.choice(len(pop), size=k, replace=False),
+                       key=lambda i: fits[i])
+            idx2 = max(np.random.choice(len(pop), size=k, replace=False),
+                       key=lambda i: fits[i])
+            t1, p1 = pop[idx1]
+            t2, p2 = pop[idx2]
+
+            child_tree = gp.crossover(t1, t2)
+            child_tree = gp.mutate(child_tree, library=library)
+            # Inherit passes from fitter parent; occasionally mutate ±1
+            child_passes = p1 if fits[idx1] >= fits[idx2] else p2
+            if np.random.random() < 0.1:
+                child_passes += np.random.choice([-1, 1])
+                child_passes = max(1, min(gp.MAX_PASSES, child_passes))
+            new_pop.append((child_tree, child_passes))
+
         pop = new_pop
 
-    # Neighborhood refinement: probability scales with fitness.
-    # Low fitness → don't bother. High fitness → always refine.
+    # Neighborhood refinement
     if np.random.random() < best_f:
-        best_t, best_f = refine(best_t, examples, library)
-    return best_t, best_f
+        best_t, best_f = refine(best_t, examples, library, best_p)
+    return best_t, best_p, best_f
 
 
-def refine(tree, examples, library=None):
-    """Try all single-node edits of tree.
-
-    Exhaustively tests every alternative terminal at every terminal position,
-    and every alternative binary op at every binary position. This is cheap
-    (typically ~150 evaluations) and converts near-misses into solutions by
-    fixing the one wrong constant or operator.
-    """
-    best_t, best_f = tree, fitness(tree, examples, library)
+def refine(tree, examples, library=None, passes=1):
+    """Try all single-node edits of tree."""
+    best_t, best_f = tree, fitness(tree, examples, library, passes)
     terminals = [("r",), ("c",), ("max_r",), ("max_c",)]
     terminals += [("const", i) for i in range(gp.NUM_COLORS)]
     for name in (library or {}):
@@ -281,9 +304,9 @@ def refine(tree, examples, library=None):
                 if term == node:
                     continue
                 c = gp.replace(tree, path, term)
-                if solves(c, examples, library):
-                    return simplify(c, examples, library), 1.0
-                f = fitness(c, examples, library)
+                if solves(c, examples, library, passes):
+                    return simplify(c, examples, library, passes), 1.0
+                f = fitness(c, examples, library, passes)
                 if f > best_f:
                     best_t, best_f = c, f
         elif gp.ARITY[op] == 2:
@@ -291,9 +314,9 @@ def refine(tree, examples, library=None):
                 if new_op == op:
                     continue
                 c = gp.replace(tree, path, (new_op, node[1], node[2]))
-                if solves(c, examples, library):
-                    return simplify(c, examples, library), 1.0
-                f = fitness(c, examples, library)
+                if solves(c, examples, library, passes):
+                    return simplify(c, examples, library, passes), 1.0
+                f = fitness(c, examples, library, passes)
                 if f > best_f:
                     best_t, best_f = c, f
     return best_t, best_f
@@ -302,17 +325,11 @@ def refine(tree, examples, library=None):
 # ── Abstraction ──────────────────────────────────────────────────────
 
 def abstract(solvers, library):
-    """Find subtrees shared by 2+ solvers and add to library.
-
-    This is the compounding mechanism: useful compositions discovered for
-    one task become single-node building blocks for future tasks. A subtree
-    of size 10 that took many generations to evolve becomes a single "lib"
-    terminal that can appear in any random tree.
-    """
+    """Find subtrees shared by 2+ solvers and add to library."""
     if len(solvers) < MIN_SHARED_SOLVERS:
         return
     sub_sources = {}
-    for i, tree in enumerate(solvers):
+    for i, (tree, _passes) in enumerate(solvers):
         seen = set()
         for _, sub in gp.subtrees(tree):
             sz = gp.size(sub)
@@ -335,36 +352,37 @@ def abstract(solvers, library):
 def evolve(tasks, rounds, library):
     """Per-task evolution with cross-task abstraction.
 
-    Each round: evolve a program for each unsolved task (budget proportional
-    to previous fitness), then abstract common subtrees from solvers into the
-    library for use in future rounds.
+    Each round: evolve a (tree, passes) program for each unsolved task,
+    then abstract common subtrees from solvers into the library.
     """
-    solved = {}       # tid → tree
-    best_fit = {}     # tid → (tree, fitness)
+    solved = {}       # tid → (tree, passes)
+    best_fit = {}     # tid → (tree, passes, fitness)
 
     for rnd in range(1, rounds + 1):
         new_count = 0
         tids = [t for t in tasks if t not in solved]
-        # Process higher-fitness tasks first (most likely to solve next)
-        tids.sort(key=lambda t: -(best_fit[t][1] if t in best_fit else 0))
+        tids.sort(key=lambda t: -(best_fit[t][2] if t in best_fit else 0))
 
         for tid in tids:
-            prev = best_fit[tid][0] if tid in best_fit else None
-            prev_f = best_fit[tid][1] if tid in best_fit else 0
+            prev_t = best_fit[tid][0] if tid in best_fit else None
+            prev_p = best_fit[tid][1] if tid in best_fit else 1
+            prev_f = best_fit[tid][2] if tid in best_fit else 0
             ps, gs = search_budget(prev_f)
-            tree, f = search(tasks[tid]["train"], seed=prev, library=library,
-                             pop_size=ps, gens=gs)
-            if f > best_fit.get(tid, (None, 0))[1]:
-                best_fit[tid] = (tree, f)
-            if solves(tree, tasks[tid]["train"], library):
-                solved[tid] = tree
+            tree, passes, f = search(tasks[tid]["train"], seed=prev_t,
+                                     seed_passes=prev_p, library=library,
+                                     pop_size=ps, gens=gs)
+            if f > best_fit.get(tid, (None, 0, 0))[2]:
+                best_fit[tid] = (tree, passes, f)
+            if solves(tree, tasks[tid]["train"], library, passes):
+                solved[tid] = (tree, passes)
                 new_count += 1
-                print(f"  ✓ {tid}: {gp.to_str(tree)}")
+                p_str = f" x{passes}" if passes > 1 else ""
+                print(f"  ✓ {tid}{p_str}: {gp.to_str(tree)}")
 
         if len(solved) >= MIN_SHARED_SOLVERS:
             abstract(list(solved.values()), library)
 
-        n_near = sum(1 for t in tids if best_fit.get(t, (None, 0))[1] > 0.8)
+        n_near = sum(1 for t in tids if best_fit.get(t, (None, 0, 0))[2] > 0.8)
         print(f"Round {rnd}: {len(solved)}/{len(tasks)} solved "
               f"(+{new_count}), {n_near} near, lib={len(library)}")
     return solved
@@ -373,12 +391,8 @@ def evolve(tasks, rounds, library):
 # ── Evaluation ───────────────────────────────────────────────────────
 
 def evaluate(tasks, library, train_solvers=None):
-    """Score on held-out test examples.
-
-    First tries transferring training solvers directly (free generalization
-    test), then runs per-task search with the learned library.
-    """
-    transfer = list({id(t): t for t in (train_solvers or {}).values()}.values())
+    """Score on held-out test examples."""
+    transfer = list({id(v): v for v in (train_solvers or {}).values()}.values())
     solved_train, solved_test, total = 0, 0, 0
 
     for tid, task in tasks.items():
@@ -389,22 +403,22 @@ def evaluate(tasks, library, train_solvers=None):
 
         # Try direct transfer from training solvers
         found = False
-        for t in transfer:
-            if solves(t, train_ex, library):
+        for tree, passes in transfer:
+            if solves(tree, train_ex, library, passes):
                 solved_train += 1
-                if solves(t, test_ex, library):
+                if solves(tree, test_ex, library, passes):
                     solved_test += 1
-                    print(f"  ✓ {tid} (transfer): {gp.to_str(t)}")
+                    print(f"  ✓ {tid} (transfer): {gp.to_str(tree)}")
                 found = True
                 break
         if found:
             continue
 
         # Per-task search
-        tree, _ = search(train_ex, library=library)
-        if solves(tree, train_ex, library):
+        tree, passes, _ = search(train_ex, library=library)
+        if solves(tree, train_ex, library, passes):
             solved_train += 1
-            if solves(tree, test_ex, library):
+            if solves(tree, test_ex, library, passes):
                 solved_test += 1
                 print(f"  ✓ {tid}: {gp.to_str(tree)}")
 
