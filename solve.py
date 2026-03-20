@@ -58,7 +58,8 @@ def candidates(max_depth, budget=200):
     weights = scores / scores.sum()
     for depth in range(1, max_depth + 1):
         for _ in range(budget):
-            yield list(np.random.choice(names, size=depth, p=weights))
+            idxs = np.random.choice(len(names), size=depth, p=weights)
+            yield [names[i] for i in idxs]
 
 # ── Pillar 3b: Abstraction (promote sub-programs as new primitives) ──
 def abstract(scored_programs):
@@ -71,11 +72,16 @@ def abstract(scored_programs):
             pair = tuple(prog[i : i + 2])
             weights[pair] = weights.get(pair, 0.0) + quality
     new = []
+    probe = np.arange(12).reshape(3, 4).tolist()  # asymmetric grid
     for pair, weight in weights.items():
-        if weight >= 1.5 and pair not in primitives:
-            name = "_".join(pair)
-            primitives[name] = (lambda p: lambda g: execute(list(p), g))(pair)
+        name = "_".join(pair)
+        if weight >= 1.5 and name not in primitives:
+            fn = (lambda p: lambda g: execute(list(p), g))(pair)
+            if np.array_equal(fn(probe), probe):
+                continue  # skip identity-equivalent compositions
+            primitives[name] = fn
             new.append(name)
+            print(f"  ++ promoted '{name}' (weight {weight:.2f})")
     return new
 
 # ── The Loop (all 4 pillars working together) ────────────────────────
@@ -95,6 +101,7 @@ def learn(tasks, rounds):
                     best_err, best_prog = err, prog
                     if err == 0.0:
                         solved += 1
+                        print(f"  ✓ {tid} solved by {prog}")
                         break
             # Pillar 2: Approximability — keep best even if imperfect
             if best_prog:
