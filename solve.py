@@ -142,8 +142,8 @@ def eval_tree(tree, grid):
 
 # ── Fitness ──────────────────────────────────────────────────────────
 def fitness(tree, examples):
-    """Weighted cell accuracy: changed cells worth 3x unchanged cells.
-    Identity scores ~0.25, perfect scores 1.0 — gradient above identity."""
+    """Weighted cell accuracy with parsimony pressure.
+    Changed cells worth 3x. Small penalty for tree size (Occam's razor)."""
     total = 0.0
     for inp, out in examples:
         got = eval_tree(tree, inp)
@@ -159,7 +159,10 @@ def fitness(tree, examples):
             score += np.sum(got[~changed] == out_a[~changed])
         max_score = 3.0 * n_ch + n_un
         total += score / max_score if max_score > 0 else 0.0
-    return total / len(examples)
+    accuracy = total / len(examples)
+    # Parsimony: prefer simpler programs (penalty ~0.02 at size 10, ~0.1 at size 50)
+    size_penalty = 0.002 * tree_size(tree)
+    return max(0.0, accuracy - size_penalty)
 
 def solves(tree, examples):
     """Exact match on all examples."""
@@ -168,6 +171,29 @@ def solves(tree, examples):
         if got is None or not np.array_equal(got, np.asarray(out)):
             return False
     return True
+
+def simplify(tree, examples):
+    """Greedily replace subtrees with simpler equivalents while preserving correctness."""
+    if not solves(tree, examples):
+        return tree
+    terminals = [("r",), ("c",), ("max_r",), ("max_c",)] + [("const", i) for i in range(10)]
+    changed = True
+    while changed:
+        changed = False
+        for path, sub in all_subtrees(tree):
+            if not path:
+                continue
+            if sub[0] not in ARITY:
+                continue  # already a terminal
+            for term in terminals:
+                candidate = replace_at(tree, path, term)
+                if solves(candidate, examples):
+                    tree = candidate
+                    changed = True
+                    break
+            if changed:
+                break  # restart scan with simplified tree
+    return tree
 
 # ── GP operators ─────────────────────────────────────────────────────
 def gp_crossover(p1, p2, max_d=7):
@@ -253,17 +279,58 @@ def abstract(solvers):
 # ── Evolution ────────────────────────────────────────────────────────
 IDENTITY = ("get", ("r",), ("c",))  # the "do nothing" program
 
+def _make_seeds():
+    """Generate useful program templates from existing primitives."""
+    R, C, MR, MC = ("r",), ("c",), ("max_r",), ("max_c",)
+    ONE = ("const", 1)
+    seeds = [IDENTITY]
+    # Geometric remaps: get(f(r,c), g(r,c))
+    comp_r = ("sub", ("sub", MR, ONE), R)  # max_r - 1 - r
+    comp_c = ("sub", ("sub", MC, ONE), C)  # max_c - 1 - c
+    seeds += [
+        ("get", C, R),                                     # transpose
+        ("get", comp_r, C),                                # flip_v
+        ("get", R, comp_c),                                # flip_h
+        ("get", comp_r, comp_c),                           # rotate 180
+        ("get", C, comp_r),                                # rotate_cw
+        ("get", comp_c, R),                                # rotate_ccw
+        ("get", ("mod", ("add", R, ONE), MR), C),          # shift_d
+        ("get", R, ("mod", ("add", C, ONE), MC)),          # shift_r
+    ]
+    # Shifts by 2-4
+    for k in range(2, 5):
+        K = ("const", k)
+        seeds.append(("get", ("mod", ("add", R, K), MR), C))
+        seeds.append(("get", R, ("mod", ("add", C, K), MC)))
+    # Conditional recolors: if(eq(get(r,c), X), Y, get(r,c))
+    for x in range(10):
+        for y in range(10):
+            if x != y:
+                seeds.append(("if", ("eq", ("get", R, C), ("const", x)),
+                              ("const", y), ("get", R, C)))
+    return seeds
+
+_SEEDS = None
+
+def get_seeds():
+    global _SEEDS
+    if _SEEDS is None:
+        _SEEDS = _make_seeds()
+    return _SEEDS
+
 def search_task(task_examples, seed=None, pop_size=80, gens=20):
     """Mini-evolution for a single task, building on previous best (seed)."""
-    # Seed population: identity + previous best + mutations + random
-    pop = [IDENTITY]
+    # Seed population: templates + previous best + mutations + random
+    seeds = get_seeds()
+    pop_size = max(pop_size, len(seeds) + 20)
+    pop = list(seeds)  # all geometric + recolor templates
     if seed is not None and seed != IDENTITY:
         pop.append(seed)
-        for _ in range(pop_size // 4):
+        for _ in range(pop_size // 6):
             pop.append(gp_subtree_mutate(seed, max_d=6))
-        for _ in range(pop_size // 4):
+        for _ in range(pop_size // 6):
             pop.append(breed(seed, IDENTITY))
-    for _ in range(pop_size // 4):
+    for _ in range(pop_size // 6):
         pop.append(gp_subtree_mutate(IDENTITY, max_d=5))
     while len(pop) < pop_size:
         pop.append(random_tree(max_depth=4))
@@ -281,6 +348,7 @@ def search_task(task_examples, seed=None, pop_size=80, gens=20):
                 best_f, best_t = f, p
                 stale = 0
         if solves(best_t, task_examples):
+            best_t = simplify(best_t, task_examples)
             return best_t, 1.0
         stale += 1
         if stale > 7:
@@ -308,10 +376,16 @@ def evolve(tasks, rounds):
     for rnd in range(1, rounds + 1):
         new_this_round = 0
         tids = [t for t in tasks if t not in all_solved]
-        np.random.shuffle(tids)
+        # Sort: near-misses first (more search budget for promising tasks)
+        tids.sort(key=lambda t: -best_fit[t][1] if t in best_fit else 0)
         for tid in tids:
             prev_best = best_fit[tid][0] if tid in best_fit else None
-            tree, f = search_task(tasks[tid]["train"], seed=prev_best)
+            prev_f = best_fit[tid][1] if tid in best_fit else 0
+            # More budget for near-misses
+            ps = 120 if prev_f > 0.85 else 80
+            gs = 30 if prev_f > 0.85 else 20
+            tree, f = search_task(tasks[tid]["train"], seed=prev_best,
+                                  pop_size=ps, gens=gs)
             if f > best_fit.get(tid, (None, 0))[1]:
                 best_fit[tid] = (tree, f)
             if solves(tree, tasks[tid]["train"]):
