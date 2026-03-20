@@ -7,6 +7,7 @@ cell (r, c) of the output grid, optionally applied for multiple passes.
 All primitives are truly atomic:
 
   Position:    r, c, max_r, max_c     (output coordinates and dimensions)
+               inp_r, inp_c           (input grid dimensions)
   Perception:  get(row, col)           (read CURRENT grid — changes each pass)
                inp(row, col)           (read ORIGINAL input — constant across passes)
   Constants:   0–9                     (ARC color values)
@@ -32,7 +33,7 @@ import numpy as np
 
 # Domain-determined (not tunable — these follow from the problem definition)
 NUM_COLORS = 10                 # ARC uses colors 0–9
-NUM_TERMINALS = 7 + NUM_COLORS  # r, c, max_r, max_c, pass_num, total_count(v), mode_color + one per color
+NUM_TERMINALS = 9 + NUM_COLORS  # r, c, max_r, max_c, inp_r, inp_c, pass_num, total_count(v), mode_color + colors
 MAX_TREE_DEPTH = 7              # limits composition depth; 7 allows ~128 nodes
 MAX_PASSES = 5                  # maximum multi-pass iterations
 
@@ -84,9 +85,11 @@ def random_tree(max_depth=4, depth=0, library=None):
         if ch == 1: return ("c",)
         if ch == 2: return ("max_r",)
         if ch == 3: return ("max_c",)
-        if ch == 4: return ("pass_num",)
-        if ch == 5: return ("mode_color",)
-        return ("const", ch - 6)
+        if ch == 4: return ("inp_r",)
+        if ch == 5: return ("inp_c",)
+        if ch == 6: return ("pass_num",)
+        if ch == 7: return ("mode_color",)
+        return ("const", ch - 8)
     ops = list(ARITY)
     op = ops[np.random.randint(len(ops))]
     children = [random_tree(max_depth, depth + 1, library) for _ in range(ARITY[op])]
@@ -150,6 +153,7 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
     r_arr = np.broadcast_to(np.arange(o_r)[:, None], (o_r, o_c))
     c_arr = np.broadcast_to(np.arange(o_c)[None, :], (o_r, o_c))
     MR, MC = np.int64(o_r), np.int64(o_c)
+    IR, IC = np.int64(orig_r), np.int64(orig_c)
     PN = np.int64(pass_num)
     node_count = [0]
 
@@ -194,6 +198,8 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
         if op == "c": return c_arr
         if op == "max_r": return MR
         if op == "max_c": return MC
+        if op == "inp_r": return IR
+        if op == "inp_c": return IC
         if op == "pass_num": return PN
         if op == "const": return np.int64(node[1])
         if op == "mode_color": return MODE_COLOR
@@ -294,9 +300,9 @@ def mutate(tree, library=None):
         op = node[0]
         if op == "const":
             return replace(tree, path, ("const", np.random.randint(NUM_COLORS)))
-        if op in ("r", "c", "max_r", "max_c", "pass_num", "mode_color"):
-            terms = [("r",), ("c",), ("max_r",), ("max_c",), ("pass_num",),
-                     ("mode_color",), ("const", np.random.randint(NUM_COLORS))]
+        if op in ("r", "c", "max_r", "max_c", "inp_r", "inp_c", "pass_num", "mode_color"):
+            terms = [("r",), ("c",), ("max_r",), ("max_c",), ("inp_r",), ("inp_c",),
+                     ("pass_num",), ("mode_color",), ("const", np.random.randint(NUM_COLORS))]
             return replace(tree, path, terms[np.random.randint(len(terms))])
         if op in ARITY and ARITY[op] == 2:
             bin_ops = [k for k, v in ARITY.items() if v == 2]

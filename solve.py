@@ -94,11 +94,12 @@ def simplify(tree, examples, library=None, passes=1):
         return tree
     R, C = ("r",), ("c",)
     replacements = [
-        R, C, ("max_r",), ("max_c",), ("mode_color",),
+        R, C, ("max_r",), ("max_c",), ("inp_r",), ("inp_c",), ("mode_color",),
         IDENTITY, ("get", C, R),
         ("inp", ("r",), ("c",)),                                   # inp(r,c)
         ("sub", ("sub", ("max_r",), ("const", 1)), R),
         ("sub", ("sub", ("max_c",), ("const", 1)), C),
+        ("inp", ("mod", ("r",), ("inp_r",)), ("mod", ("c",), ("inp_c",))),  # tiling
     ] + [("const", i) for i in range(gp.NUM_COLORS)]
     changed = True
     while changed:
@@ -221,6 +222,32 @@ def make_seeds():
     seeds.append((("if", ("mod", ("add", R, C), ("const", 2)),
                    ("get", R, C), ("const", 0)), 1))           # checkerboard mask
 
+    IR, IC = ("inp_r",), ("inp_c",)
+
+    # (Double recolors moved to task-specific hypothesis generation)
+
+    # ── Tiling with input dimensions ──────────────────────────────
+    # Tile input into larger output: inp(r % inp_r, c % inp_c)
+    seeds.append((("inp", ("mod", R, IR), ("mod", C, IC)), 1))
+    # Tile + flip alternating: inp(r%inp_r, inp_c-1-(c%inp_c)) for even tiles
+    seeds.append((("inp", ("mod", R, IR),
+                   ("if", ("mod", ("sub", R, ("mod", R, IR)), IR),
+                    ("sub", ("sub", IC, ONE), ("mod", C, IC)),
+                    ("mod", C, IC))), 1))
+    # Double horizontally: inp(r, c % inp_c)
+    seeds.append((("inp", R, ("mod", C, IC)), 1))
+    # Double vertically: inp(r % inp_r, c)
+    seeds.append((("inp", ("mod", R, IR), C), 1))
+
+    # ── Cropping/extraction seeds ─────────────────────────────────
+    # Read from offset position in input (extract subgrid)
+    for offset_r in range(5):
+        for offset_c in range(5):
+            if offset_r == 0 and offset_c == 0:
+                continue
+            seeds.append((("inp", ("add", R, ("const", offset_r)),
+                                  ("add", C, ("const", offset_c))), 1))
+
     # ── Derived primitive seeds ─────────────────────────────────────
 
     # Background removal: if cell == mode_color, set to 0
@@ -292,6 +319,37 @@ def make_seeds():
     seeds.append((propagate, 2))
     seeds.append((propagate, 3))
 
+    # Propagate from all 4 directions (more complete flood fill)
+    propagate_4 = ("if", ("inp", R, C), ("inp", R, C),
+                   ("if", ("get", ("add", R, ONE), C), ("get", ("add", R, ONE), C),
+                    ("if", ("get", ("sub", R, ONE), C), ("get", ("sub", R, ONE), C),
+                     ("if", ("get", R, ("add", C, ONE)), ("get", R, ("add", C, ONE)),
+                      ("if", ("get", R, ("sub", C, ONE)), ("get", R, ("sub", C, ONE)),
+                       ("get", R, C))))))
+    for p in [2, 3, 5]:
+        seeds.append((propagate_4, p))
+
+    # Fill zeros using n_count: if cell is 0 and has neighbors of color X, become X
+    for color in range(1, 5):
+        CV = ("const", color)
+        fill_near = ("if", ("get", R, C), ("get", R, C),
+                     ("if", ("n_count", R, C, CV), CV, ("get", R, C)))
+        for p in [2, 3, 5]:
+            seeds.append((fill_near, p))
+
+    # Symmetric fill: if cell is 0, try reading from mirror position
+    sym_h = ("if", ("get", R, C), ("get", R, C),
+             ("get", R, ("sub", ("sub", MC, ONE), C)))
+    sym_v = ("if", ("get", R, C), ("get", R, C),
+             ("get", ("sub", ("sub", MR, ONE), R), C))
+    seeds.append((sym_h, 1))
+    seeds.append((sym_v, 1))
+    seeds.append((sym_h, 2))
+    seeds.append((sym_v, 2))
+
+    # Majority fill: if cell is 0, become mode_color
+    seeds.append((("if", ("get", R, C), ("get", R, C), ("mode_color",)), 1))
+
     return seeds
 
 
@@ -315,8 +373,8 @@ def search(examples, seed=None, seed_passes=1, library=None,
     if pop_size is None or gens is None:
         pop_size, gens = POP_SIZE_BASE, GENERATIONS_BASE
 
-    # Always include seed templates for crossover material
-    pop = list(make_seeds())
+    # Always include seed templates + task-specific hypotheses for crossover material
+    pop = list(make_seeds()) + list(task_hypotheses(examples))
 
     # Transfer: include programs that solved other tasks + mutations
     if transfer:
@@ -411,7 +469,7 @@ def search(examples, seed=None, seed_passes=1, library=None,
 def refine(tree, examples, library=None, passes=1):
     """Try all single-node edits of tree."""
     best_t, best_f = tree, fitness(tree, examples, library, passes)
-    terminals = [("r",), ("c",), ("max_r",), ("max_c",)]
+    terminals = [("r",), ("c",), ("max_r",), ("max_c",), ("inp_r",), ("inp_c",), ("mode_color",)]
     terminals += [("const", i) for i in range(gp.NUM_COLORS)]
     for name in (library or {}):
         terminals.append(("lib", name))
@@ -469,6 +527,121 @@ def abstract(solvers, library):
 
 # ── Evolution loop ───────────────────────────────────────────────────
 
+def task_hypotheses(examples):
+    """Generate task-specific program hypotheses from input/output analysis.
+
+    Examines the training examples to find consistent patterns and generates
+    targeted seeds. This is principled — it's smarter search, not new primitives.
+    """
+    R, C = ("r",), ("c",)
+    ONE = ("const", 1)
+    hypotheses = []
+    inp0, out0 = np.asarray(examples[0][0]), np.asarray(examples[0][1])
+
+    # 1. Color mapping: if every cell of color X always maps to color Y
+    if inp0.shape == out0.shape:
+        color_map = {}
+        consistent = True
+        for inp, out in examples:
+            ia, oa = np.asarray(inp), np.asarray(out)
+            if ia.shape != oa.shape:
+                consistent = False
+                break
+            for r in range(ia.shape[0]):
+                for c in range(ia.shape[1]):
+                    v_in, v_out = int(ia[r, c]), int(oa[r, c])
+                    if v_in in color_map:
+                        if color_map[v_in] != v_out:
+                            consistent = False
+                            break
+                    else:
+                        color_map[v_in] = v_out
+                if not consistent:
+                    break
+            if not consistent:
+                break
+        if consistent and color_map:
+            changed = {k: v for k, v in color_map.items() if k != v}
+            if 0 < len(changed) <= 4:
+                tree = ("get", R, C)
+                for src, dst in changed.items():
+                    tree = ("if", ("eq", ("get", R, C), ("const", src)),
+                            ("const", dst), tree)
+                hypotheses.append((tree, 1))
+
+    # 2. Size-ratio tiling: if output is integer multiple of input
+    if inp0.shape[0] > 0 and inp0.shape[1] > 0:
+        ratio_r = out0.shape[0] / inp0.shape[0]
+        ratio_c = out0.shape[1] / inp0.shape[1]
+        IR, IC = ("inp_r",), ("inp_c",)
+        if ratio_r == int(ratio_r) and ratio_c == int(ratio_c) and (ratio_r > 1 or ratio_c > 1):
+            # Simple tiling
+            hypotheses.append((("inp", ("mod", R, IR), ("mod", C, IC)), 1))
+            # Tiling with horizontal flip on odd columns
+            flip_c = ("sub", ("sub", IC, ONE), ("mod", C, IC))
+            hypotheses.append((("inp", ("mod", R, IR),
+                                ("if", ("mod", ("sub", C, ("mod", C, IC)), IC),
+                                 flip_c, ("mod", C, IC))), 1))
+
+    # 3. For same-size tasks: analyze which cells change and what they need
+    if inp0.shape == out0.shape:
+        diff = inp0 != out0
+        if diff.any():
+            changed_from = set(inp0[diff].tolist())
+            changed_to = set(out0[diff].tolist())
+            unchanged_vals = set(inp0[~diff].tolist())
+
+            # "Change all of color X to Y, but only when neighbor condition"
+            # For each (from_color, to_color) pair, try n_count conditions
+            for fc in changed_from:
+                mask_fc = inp0 == fc
+                actually_changed = mask_fc & diff
+                stayed_same = mask_fc & ~diff
+                if actually_changed.any() and stayed_same.any():
+                    # Some cells of this color change, others don't → spatial condition
+                    to_vals = set(out0[actually_changed].tolist())
+                    for tv in to_vals:
+                        # Try: change fc→tv if n_count of fc neighbors < threshold
+                        for thresh in range(1, 5):
+                            hypotheses.append((
+                                ("if", ("eq", ("get", R, C), ("const", fc)),
+                                 ("if", ("gt", ("const", thresh),
+                                         ("n_count", R, C, ("const", fc))),
+                                  ("const", tv), ("get", R, C)),
+                                 ("get", R, C)), 1))
+                            hypotheses.append((
+                                ("if", ("eq", ("get", R, C), ("const", fc)),
+                                 ("if", ("gt", ("n_count", R, C, ("const", fc)),
+                                         ("const", thresh)),
+                                  ("const", tv), ("get", R, C)),
+                                 ("get", R, C)), 1))
+
+            # "Fill zeros based on row/col content"
+            if 0 in changed_from and not (set(changed_from) - {0}):
+                # Only zeros change — fill pattern
+                fill_colors = list(changed_to - {0})
+                for fc in fill_colors[:3]:
+                    # Fill zeros with fc if row has fc
+                    hypotheses.append((
+                        ("if", ("get", R, C), ("get", R, C),
+                         ("if", ("row_count", R, ("const", fc)), ("const", fc),
+                          ("get", R, C))), 1))
+                    # Fill zeros with fc if col has fc
+                    hypotheses.append((
+                        ("if", ("get", R, C), ("get", R, C),
+                         ("if", ("col_count", C, ("const", fc)), ("const", fc),
+                          ("get", R, C))), 1))
+                    # Fill zeros with fc if both row and col have fc
+                    hypotheses.append((
+                        ("if", ("get", R, C), ("get", R, C),
+                         ("if", ("row_count", R, ("const", fc)),
+                          ("if", ("col_count", C, ("const", fc)),
+                           ("const", fc), ("get", R, C)),
+                          ("get", R, C))), 1))
+
+    return hypotheses
+
+
 def seed_sweep(tasks, library):
     """Fast first pass: test all seed templates on all tasks. No evolution.
 
@@ -482,7 +655,9 @@ def seed_sweep(tasks, library):
     for tid, task in tasks.items():
         examples = task["train"]
         best_t, best_p, best_f = IDENTITY, 1, 0.0
-        for tree, passes in seeds:
+        # Test generic seeds + task-specific hypotheses
+        task_seeds = seeds + task_hypotheses(examples)
+        for tree, passes in task_seeds:
             if solves(tree, examples, library, passes):
                 tree = simplify(tree, examples, library, passes)
                 solved[tid] = (tree, passes)
