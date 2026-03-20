@@ -211,6 +211,14 @@ def make_seeds():
     # Conditional: if cell==0, read from first row/column
     seeds.append((("if", ("get", R, C), ("get", R, C), ("get", ("const", 0), C)), 1))
     seeds.append((("if", ("get", R, C), ("get", R, C), ("get", R, ("const", 0))), 1))
+    # Tiling: repeat a k×k tile across the grid
+    for k in range(2, 6):
+        K = ("const", k)
+        seeds.append((("get", ("mod", R, K), ("mod", C, K)), 1))
+    # Modular position patterns (checkerboard-like)
+    seeds.append((("mod", ("add", R, C), ("const", 2)), 1))    # checkerboard 0/1
+    seeds.append((("if", ("mod", ("add", R, C), ("const", 2)),
+                   ("get", R, C), ("const", 0)), 1))           # checkerboard mask
 
     # Multi-pass templates: neighbor-aware rules (2-3 passes)
     # "If any neighbor has color X, become X" — flood-fill-like
