@@ -35,11 +35,14 @@ primitives = {
 _prim_score = {}  # primitive name -> cumulative usefulness
 
 def load(path):
-    """Load ARC tasks: {task_id: [(input, output), ...]}."""
+    """Load ARC tasks: {task_id: {"train": [...], "test": [...]}}."""
     tasks = {}
     for f in sorted(Path(path).glob("*.json")):
         t = json.loads(f.read_text())
-        tasks[f.stem] = [(e["input"], e["output"]) for e in t["train"]]
+        tasks[f.stem] = {
+            "train": [(e["input"], e["output"]) for e in t["train"]],
+            "test":  [(e["input"], e["output"]) for e in t.get("test", [])],
+        }
     return tasks
 
 # ── Pillar 3a: Composition (programs = chains of primitives) ─────────
@@ -110,7 +113,8 @@ def learn(tasks, rounds):
     best_so_far = {}  # tid -> (prog, err) — persists across rounds
     for r in range(1, rounds + 1):
         solved, best_programs = 0, []
-        for tid, examples in tasks.items():
+        for tid, task in tasks.items():
+            examples = task["train"]
             best_err = best_so_far[tid][1] if tid in best_so_far else 1.0
             best_prog = best_so_far[tid][0] if tid in best_so_far else None
             # Pillar 4: Exploration — try all compositions
@@ -151,12 +155,69 @@ def learn(tasks, rounds):
         print(f"Round {r}: {solved}/{len(tasks)} solved, {approx} near-misses, "
               f"{len(primitives)} primitives (+{len(new)} new)")
 
+# ── Evaluation (frozen primitives, held-out test) ─────────────────────
+def evaluate(tasks):
+    """Find best program per task using train examples, score on test examples.
+    Primitives are frozen — no learning, no abstraction."""
+    solved_train, solved_test, total = 0, 0, 0
+    for tid, task in tasks.items():
+        train_ex, test_ex = task["train"], task["test"]
+        if not test_ex:
+            continue
+        total += 1
+        # Find best program using train examples
+        best_err, best_prog = 1.0, None
+        for prog in candidates(max_depth=2, budget=200):
+            err = error(prog, train_ex)
+            if err < best_err:
+                best_err, best_prog = err, prog
+                if err == 0.0:
+                    break
+        # Also try extending depth-1 programs to depth-3
+        if best_err > 0.0:
+            for prog in candidates(max_depth=1, budget=50):
+                for name in primitives:
+                    for ext in ([name] + prog, prog + [name]):
+                        err = error(ext, train_ex)
+                        if err < best_err:
+                            best_err, best_prog = err, ext
+                            if err == 0.0:
+                                break
+                    if best_err == 0.0:
+                        break
+                if best_err == 0.0:
+                    break
+        if best_err == 0.0:
+            solved_train += 1
+            # Test on held-out examples
+            test_err = error(best_prog, test_ex)
+            if test_err == 0.0:
+                solved_test += 1
+                print(f"  ✓ {tid} eval pass: {best_prog}")
+            else:
+                print(f"  ~ {tid} train pass, eval fail: {best_prog}")
+    print(f"Eval: {solved_test}/{total} test solved "
+          f"({solved_train} solved on train examples)")
+    return solved_test
+
 # ── Main ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "data/ARC-AGI/data/training"
-    rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 3
-    if not os.path.isdir(path):
-        sys.exit(f"Data not found: {path}")
-    tasks = load(path)
-    print(f"Loaded {len(tasks)} tasks, {len(primitives)} primitives")
-    learn(tasks, rounds)
+    train_path = sys.argv[1] if len(sys.argv) > 1 else "data/ARC-AGI/data/training"
+    eval_path  = sys.argv[2] if len(sys.argv) > 2 else "data/ARC-AGI/data/evaluation"
+    rounds     = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+    if not os.path.isdir(train_path):
+        sys.exit(f"Training data not found: {train_path}")
+
+    # Phase 1: Train — learn primitives and abstractions
+    train_tasks = load(train_path)
+    print(f"Loaded {len(train_tasks)} training tasks, {len(primitives)} primitives")
+    learn(train_tasks, rounds)
+
+    # Phase 2: Evaluate — frozen primitives on held-out eval set
+    if os.path.isdir(eval_path):
+        eval_tasks = load(eval_path)
+        print(f"\n{'='*60}")
+        print(f"Evaluating on {len(eval_tasks)} held-out tasks "
+              f"({len(primitives)} learned primitives)")
+        print(f"{'='*60}")
+        evaluate(eval_tasks)
