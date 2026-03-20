@@ -176,23 +176,34 @@ def simplify(tree, examples):
     """Greedily replace subtrees with simpler equivalents while preserving correctness."""
     if not solves(tree, examples):
         return tree
-    terminals = [("r",), ("c",), ("max_r",), ("max_c",)] + [("const", i) for i in range(10)]
+    # Try terminals and small useful subtrees as replacements
+    R, C = ("r",), ("c",)
+    replacements = [R, C, ("max_r",), ("max_c",)]
+    replacements += [("const", i) for i in range(10)]
+    replacements += [IDENTITY, ("get", C, R)]  # identity and transpose
+    replacements += [("sub", ("sub", ("max_r",), ("const", 1)), R)]  # max_r-1-r
+    replacements += [("sub", ("sub", ("max_c",), ("const", 1)), C)]  # max_c-1-c
     changed = True
     while changed:
         changed = False
-        for path, sub in all_subtrees(tree):
+        subs = all_subtrees(tree)
+        # Try largest subtrees first (biggest simplification wins)
+        subs.sort(key=lambda ps: -tree_size(ps[1]))
+        for path, sub in subs:
             if not path:
                 continue
             if sub[0] not in ARITY:
-                continue  # already a terminal
-            for term in terminals:
-                candidate = replace_at(tree, path, term)
+                continue
+            for repl in replacements:
+                if tree_size(repl) >= tree_size(sub):
+                    continue  # only replace with something smaller
+                candidate = replace_at(tree, path, repl)
                 if solves(candidate, examples):
                     tree = candidate
                     changed = True
                     break
             if changed:
-                break  # restart scan with simplified tree
+                break
     return tree
 
 # ── GP operators ─────────────────────────────────────────────────────
@@ -400,11 +411,15 @@ def evolve(tasks, rounds):
         n_near = sum(1 for t in tids if best_fit.get(t, (None, 0))[1] > 0.8)
         print(f"Round {rnd}: {len(all_solved)}/{len(tasks)} solved "
               f"(+{new_this_round}), {n_near} near, lib={len(library)}")
+    return all_solved
 
 # ── Evaluation ───────────────────────────────────────────────────────
-def evaluate(tasks):
-    """Per-task evolutionary search with frozen library."""
+def evaluate(tasks, train_solvers=None):
+    """Per-task evolutionary search with frozen library.
+    Also tries known training solvers directly (transfer)."""
     solved_train, solved_test, total = 0, 0, 0
+    # Collect unique solver trees from training for direct transfer
+    transfer = list({id(t): t for t in (train_solvers or {}).values()}.values())
     for tid, task in tasks.items():
         train_ex, test_ex = task["train"], task["test"]
         if not test_ex:
@@ -412,7 +427,22 @@ def evaluate(tasks):
         if not all(np.array(i).shape == np.array(o).shape for i, o in test_ex):
             continue
         total += 1
-        tree, _ = search_task(train_ex, pop_size=80, gens=20)
+        # First: try all training solvers directly (fast transfer)
+        found = False
+        for t in transfer:
+            if solves(t, train_ex):
+                solved_train += 1
+                if solves(t, test_ex):
+                    solved_test += 1
+                    print(f"  ✓ {tid} eval pass (transfer): {tree_str(t)}")
+                else:
+                    print(f"  ~ {tid} train pass (transfer), eval fail")
+                found = True
+                break
+        if found:
+            continue
+        # Then: per-task evolution
+        tree, _ = search_task(train_ex, pop_size=100, gens=25)
         if solves(tree, train_ex):
             solved_train += 1
             if solves(tree, test_ex):
@@ -427,13 +457,13 @@ def evaluate(tasks):
 if __name__ == "__main__":
     train_path = sys.argv[1] if len(sys.argv) > 1 else "data/ARC-AGI/data/training"
     eval_path  = sys.argv[2] if len(sys.argv) > 2 else "data/ARC-AGI/data/evaluation"
-    rounds     = int(sys.argv[3]) if len(sys.argv) > 3 else 20
+    rounds     = int(sys.argv[3]) if len(sys.argv) > 3 else 50
     if not os.path.isdir(train_path):
         sys.exit(f"Training data not found: {train_path}")
 
     train_tasks = filter_same_size(load(train_path))
     print(f"Loaded {len(train_tasks)} same-size training tasks")
-    evolve(train_tasks, rounds)
+    train_solved = evolve(train_tasks, rounds)
 
     if os.path.isdir(eval_path):
         eval_tasks = filter_same_size(load(eval_path))
@@ -441,4 +471,4 @@ if __name__ == "__main__":
         print(f"Evaluating on {len(eval_tasks)} same-size eval tasks "
               f"(library={len(library)})")
         print(f"{'='*60}")
-        evaluate(eval_tasks)
+        evaluate(eval_tasks, train_solvers=train_solved)
