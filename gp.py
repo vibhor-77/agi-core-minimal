@@ -13,6 +13,13 @@ All primitives are truly atomic:
   Arithmetic:  add, sub, mod           (coordinate math)
   Logic:       eq, gt, if              (comparison and branching)
 
+Derived primitives (provably equivalent to compositions of atomics):
+  Neighborhood: n_count(r, c, v)       (count of 4-neighbors with color v)
+  Row/column:   row_count(r, v)        (count of color v in row r)
+                col_count(c, v)        (count of color v in column c)
+  Global:       total_count(v)         (count of color v in input)
+                mode_color             (most common color in input)
+
 Multi-pass: when passes > 1, the tree is applied repeatedly. Each pass reads
 its own output from the previous pass via `get`, while `inp` always reads the
 original input. This enables information propagation (cellular automata),
@@ -25,7 +32,7 @@ import numpy as np
 
 # Domain-determined (not tunable — these follow from the problem definition)
 NUM_COLORS = 10                 # ARC uses colors 0–9
-NUM_TERMINALS = 5 + NUM_COLORS  # r, c, max_r, max_c, pass_num + one per color
+NUM_TERMINALS = 7 + NUM_COLORS  # r, c, max_r, max_c, pass_num, total_count(v), mode_color + one per color
 MAX_TREE_DEPTH = 7              # limits composition depth; 7 allows ~128 nodes
 MAX_PASSES = 5                  # maximum multi-pass iterations
 
@@ -56,6 +63,11 @@ ARITY = {
     "get": 2,                          # read current grid (changes each pass)
     "inp": 2,                          # read original input (constant across passes)
     "if": 3,                           # conditional
+    # Derived primitives (provably equivalent to atomic compositions)
+    "n_count": 3,                      # count of 4-neighbors with color v at (r, c)
+    "row_count": 2,                    # count of cells in row r with color v
+    "col_count": 2,                    # count of cells in col c with color v
+    "total_count": 1,                  # count of all cells with color v in input
 }
 
 
@@ -73,7 +85,8 @@ def random_tree(max_depth=4, depth=0, library=None):
         if ch == 2: return ("max_r",)
         if ch == 3: return ("max_c",)
         if ch == 4: return ("pass_num",)
-        return ("const", ch - 5)
+        if ch == 5: return ("mode_color",)
+        return ("const", ch - 6)
     ops = list(ARITY)
     op = ops[np.random.randint(len(ops))]
     children = [random_tree(max_depth, depth + 1, library) for _ in range(ARITY[op])]
@@ -140,6 +153,37 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
     PN = np.int64(pass_num)
     node_count = [0]
 
+    # Pre-compute derived aggregations on g_current
+    # Neighbor count: for each (r, c, v), count of 4-neighbors equal to v
+    # We pre-compute per-color neighbor count maps
+    _n_count_cache = {}
+    def _get_n_count(v):
+        v = int(v) % NUM_COLORS
+        if v not in _n_count_cache:
+            mask = (g_current == v).astype(np.int64)
+            count = np.zeros_like(mask)
+            if cur_r > 1:
+                count[1:, :] += mask[:-1, :]   # neighbor above
+                count[:-1, :] += mask[1:, :]   # neighbor below
+            if cur_c > 1:
+                count[:, 1:] += mask[:, :-1]   # neighbor left
+                count[:, :-1] += mask[:, 1:]   # neighbor right
+            _n_count_cache[v] = count
+        return _n_count_cache[v]
+
+    # Row/column color counts: row_hist[r, v] = count of color v in row r
+    row_hist = np.zeros((cur_r, NUM_COLORS), dtype=np.int64)
+    col_hist = np.zeros((cur_c, NUM_COLORS), dtype=np.int64)
+    for v in range(NUM_COLORS):
+        row_hist[:, v] = (g_current == v).sum(axis=1)
+        col_hist[:, v] = (g_current == v).sum(axis=0)
+
+    # Global aggregation on original input
+    global_hist = np.zeros(NUM_COLORS, dtype=np.int64)
+    for v in range(NUM_COLORS):
+        global_hist[v] = (g_original == v).sum()
+    MODE_COLOR = np.int64(np.argmax(global_hist))
+
     def _eval(node):
         node_count[0] += 1
         if node_count[0] > MAX_EVAL_NODES:
@@ -152,10 +196,15 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
         if op == "max_c": return MC
         if op == "pass_num": return PN
         if op == "const": return np.int64(node[1])
+        if op == "mode_color": return MODE_COLOR
         if op == "lib":
             sub = (library or {}).get(node[1])
             return _eval(sub) if sub is not None else np.int64(0)
         # Functions
+        if op == "total_count":
+            v = _eval(node[1])
+            v_int = np.clip(np.asarray(v).flat[0], 0, NUM_COLORS - 1).astype(int)
+            return np.int64(global_hist[v_int])
         a = _eval(node[1])
         b = _eval(node[2])
         if op == "add": return a + b
@@ -173,6 +222,21 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
             return g_original[ri, ci]
         if op == "if":
             return np.where(a != 0, b, _eval(node[3]))
+        if op == "n_count":
+            c_val = _eval(node[3])
+            v_int = int(np.clip(np.asarray(c_val).flat[0], 0, NUM_COLORS - 1))
+            nc = _get_n_count(v_int)
+            ri = np.clip(np.broadcast_to(np.asarray(a), (o_r, o_c)), 0, cur_r - 1).astype(int)
+            ci = np.clip(np.broadcast_to(np.asarray(b), (o_r, o_c)), 0, cur_c - 1).astype(int)
+            return nc[ri, ci]
+        if op == "row_count":
+            ri = np.clip(np.broadcast_to(np.asarray(a), (o_r, o_c)), 0, cur_r - 1).astype(int)
+            vi = np.clip(np.broadcast_to(np.asarray(b), (o_r, o_c)), 0, NUM_COLORS - 1).astype(int)
+            return row_hist[ri.ravel(), vi.ravel()].reshape(o_r, o_c)
+        if op == "col_count":
+            ci = np.clip(np.broadcast_to(np.asarray(a), (o_r, o_c)), 0, cur_c - 1).astype(int)
+            vi = np.clip(np.broadcast_to(np.asarray(b), (o_r, o_c)), 0, NUM_COLORS - 1).astype(int)
+            return col_hist[ci.ravel(), vi.ravel()].reshape(o_r, o_c)
         return np.int64(0)
 
     try:
@@ -230,9 +294,9 @@ def mutate(tree, library=None):
         op = node[0]
         if op == "const":
             return replace(tree, path, ("const", np.random.randint(NUM_COLORS)))
-        if op in ("r", "c", "max_r", "max_c", "pass_num"):
+        if op in ("r", "c", "max_r", "max_c", "pass_num", "mode_color"):
             terms = [("r",), ("c",), ("max_r",), ("max_c",), ("pass_num",),
-                     ("const", np.random.randint(NUM_COLORS))]
+                     ("mode_color",), ("const", np.random.randint(NUM_COLORS))]
             return replace(tree, path, terms[np.random.randint(len(terms))])
         if op in ARITY and ARITY[op] == 2:
             bin_ops = [k for k, v in ARITY.items() if v == 2]

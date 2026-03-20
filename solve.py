@@ -94,7 +94,8 @@ def simplify(tree, examples, library=None, passes=1):
         return tree
     R, C = ("r",), ("c",)
     replacements = [
-        R, C, ("max_r",), ("max_c",), IDENTITY, ("get", C, R),
+        R, C, ("max_r",), ("max_c",), ("mode_color",),
+        IDENTITY, ("get", C, R),
         ("inp", ("r",), ("c",)),                                   # inp(r,c)
         ("sub", ("sub", ("max_r",), ("const", 1)), R),
         ("sub", ("sub", ("max_c",), ("const", 1)), C),
@@ -219,6 +220,56 @@ def make_seeds():
     seeds.append((("mod", ("add", R, C), ("const", 2)), 1))    # checkerboard 0/1
     seeds.append((("if", ("mod", ("add", R, C), ("const", 2)),
                    ("get", R, C), ("const", 0)), 1))           # checkerboard mask
+
+    # ── Derived primitive seeds ─────────────────────────────────────
+
+    # Background removal: if cell == mode_color, set to 0
+    seeds.append((("if", ("eq", ("get", R, C), ("mode_color",)),
+                   ("const", 0), ("get", R, C)), 1))
+    # Background removal: if cell == mode_color, keep 0; else keep cell
+    for y in range(1, gp.NUM_COLORS):
+        seeds.append((("if", ("eq", ("get", R, C), ("mode_color",)),
+                       ("const", y), ("get", R, C)), 1))
+
+    # Edge detection: keep cells with 3+ same-color neighbors
+    seeds.append((("if", ("gt", ("n_count", R, C, ("get", R, C)), ("const", 2)),
+                   ("get", R, C), ("const", 0)), 1))
+    # Edge detection: keep cells with <4 same-color neighbors (boundary cells)
+    seeds.append((("if", ("gt", ("const", 4), ("n_count", R, C, ("get", R, C))),
+                   ("get", R, C), ("const", 0)), 1))
+    # Interior detection: cells fully surrounded (4 same-color neighbors)
+    seeds.append((("if", ("eq", ("n_count", R, C, ("get", R, C)), ("const", 4)),
+                   ("get", R, C), ("const", 0)), 1))
+    # Flood fill via n_count: if any neighbor has color X, become X (multi-pass)
+    for color in range(1, 5):
+        CV = ("const", color)
+        seeds.append((("if", ("n_count", R, C, CV),
+                       CV, ("get", R, C)), 2))
+        seeds.append((("if", ("n_count", R, C, CV),
+                       CV, ("get", R, C)), 3))
+    # Neighbor-based: if cell is 0 but has non-zero neighbor, take neighbor color
+    seeds.append((("if", ("get", R, C), ("get", R, C),
+                   ("if", ("n_count", R, C, ("const", 0)),
+                    ("get", R, C), ("const", 0))), 2))
+
+    # Row-based patterns: if row has any of color X, fill row with Y
+    for x in range(1, 5):
+        seeds.append((("if", ("row_count", R, ("const", x)),
+                       ("const", x), ("get", R, C)), 1))
+        seeds.append((("if", ("row_count", R, ("const", x)),
+                       ("const", x), ("const", 0)), 1))
+    # Column-based patterns: if col has any of color X, fill col with Y
+    for x in range(1, 5):
+        seeds.append((("if", ("col_count", C, ("const", x)),
+                       ("const", x), ("get", R, C)), 1))
+        seeds.append((("if", ("col_count", C, ("const", x)),
+                       ("const", x), ("const", 0)), 1))
+    # Row/col intersection: color cell if both row and col have color X
+    for x in range(1, 5):
+        seeds.append((("if", ("gt", ("row_count", R, ("const", x)), ("const", 0)),
+                       ("if", ("gt", ("col_count", C, ("const", x)), ("const", 0)),
+                        ("const", x), ("get", R, C)),
+                       ("get", R, C)), 1))
 
     # Multi-pass templates: neighbor-aware rules (2-3 passes)
     # "If any neighbor has color X, become X" — flood-fill-like
