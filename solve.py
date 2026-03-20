@@ -356,8 +356,8 @@ def make_seeds():
 # ── Search ───────────────────────────────────────────────────────────
 
 def search_budget(prev_fitness):
-    """Search effort scales continuously with fitness."""
-    scale = 1.0 + prev_fitness
+    """Search effort scales continuously with fitness. Higher fitness = much more search."""
+    scale = 1.0 + prev_fitness * 2  # steeper scaling for near-misses
     return int(POP_SIZE_BASE * scale), int(GENERATIONS_BASE * scale)
 
 
@@ -373,8 +373,13 @@ def search(examples, seed=None, seed_passes=1, library=None,
     if pop_size is None or gens is None:
         pop_size, gens = POP_SIZE_BASE, GENERATIONS_BASE
 
-    # Always include seed templates + task-specific hypotheses for crossover material
-    pop = list(make_seeds()) + list(task_hypotheses(examples))
+    # Rank all seed templates by fitness, keep top ones for focused search
+    all_seeds = list(make_seeds()) + list(task_hypotheses(examples))
+    seed_fits = [(fitness(t, examples, library, p), (t, p)) for t, p in all_seeds]
+    seed_fits.sort(reverse=True)
+    # Keep top 40 seeds + all that solve the task
+    top_seeds = [tp for _, tp in seed_fits[:40]]
+    pop = list(top_seeds)
 
     # Transfer: include programs that solved other tasks + mutations
     if transfer:
@@ -388,6 +393,12 @@ def search(examples, seed=None, seed_passes=1, library=None,
         pop.append((seed, seed_passes))
         for _ in range(n_mutants):
             pop.append((gp.mutate(seed, library=library), seed_passes))
+
+    # Mutate the best seeds too — explore their neighborhood
+    for i in range(min(10, len(top_seeds))):
+        t, p = top_seeds[i]
+        for _ in range(3):
+            pop.append((gp.mutate(t, library=library), p))
 
     # Identity mutations
     for _ in range(n_mutants):
@@ -455,14 +466,15 @@ def search(examples, seed=None, seed_passes=1, library=None,
 
         pop = new_pop
 
-    # Iterative refinement: try single-node edits, then refine the result
+    # Iterative refinement: try single-node edits, chain improvements
     if best_f > 0.5:
-        t2, f2 = refine(best_t, examples, library, best_p)
-        if f2 > best_f:
+        for _ in range(4):  # up to 4 rounds of refinement
+            t2, f2 = refine(best_t, examples, library, best_p)
+            if f2 <= best_f:
+                break
             best_t, best_f = t2, f2
-            # If first refinement improved, try again (finds 2-edit solutions)
-            if best_f < 1.0:
-                best_t, best_f = refine(best_t, examples, library, best_p)
+            if best_f >= 1.0:
+                break
     return best_t, best_p, best_f
 
 
@@ -497,6 +509,47 @@ def refine(tree, examples, library=None, passes=1):
                 f = fitness(c, examples, library, passes)
                 if f > best_f:
                     best_t, best_f = c, f
+    return best_t, best_f
+
+
+def refine_wrap(tree, examples, library=None, passes=1):
+    """Try wrapping subtrees in conditionals using derived primitives.
+
+    This catches cases where the base program is right for MOST cells but
+    needs a spatial condition to handle a subset differently.
+    """
+    best_t, best_f = tree, fitness(tree, examples, library, passes)
+    R, C = ("r",), ("c",)
+
+    # Analyze what colors need to change
+    inp0, out0 = np.asarray(examples[0][0]), np.asarray(examples[0][1])
+    if inp0.shape != out0.shape:
+        return best_t, best_f
+
+    diff = inp0 != out0
+    if not diff.any():
+        return best_t, best_f
+
+    # For each changed color, try wrapping tree output with n_count condition
+    changed_from = set(inp0[diff].tolist())
+    for fc in changed_from:
+        for tv in set(out0[diff].tolist()):
+            for thresh in range(5):
+                # If tree output == fc and n_count condition, change to tv
+                for cmp_op in ["gt", "eq"]:
+                    wrapper = ("if", ("eq", tree, ("const", fc)),
+                               ("if", (cmp_op, ("n_count", R, C, ("const", fc)),
+                                       ("const", thresh)),
+                                ("const", tv), tree),
+                               tree)
+                    if gp.depth(wrapper) <= gp.MAX_TREE_DEPTH:
+                        c = wrapper
+                        if solves(c, examples, library, passes):
+                            return simplify(c, examples, library, passes), 1.0
+                        f = fitness(c, examples, library, passes)
+                        if f > best_f:
+                            best_t, best_f = c, f
+
     return best_t, best_f
 
 
@@ -621,23 +674,76 @@ def task_hypotheses(examples):
                 # Only zeros change — fill pattern
                 fill_colors = list(changed_to - {0})
                 for fc in fill_colors[:3]:
+                    FC = ("const", fc)
                     # Fill zeros with fc if row has fc
                     hypotheses.append((
                         ("if", ("get", R, C), ("get", R, C),
-                         ("if", ("row_count", R, ("const", fc)), ("const", fc),
+                         ("if", ("row_count", R, FC), FC,
                           ("get", R, C))), 1))
                     # Fill zeros with fc if col has fc
                     hypotheses.append((
                         ("if", ("get", R, C), ("get", R, C),
-                         ("if", ("col_count", C, ("const", fc)), ("const", fc),
+                         ("if", ("col_count", C, FC), FC,
                           ("get", R, C))), 1))
                     # Fill zeros with fc if both row and col have fc
                     hypotheses.append((
                         ("if", ("get", R, C), ("get", R, C),
-                         ("if", ("row_count", R, ("const", fc)),
-                          ("if", ("col_count", C, ("const", fc)),
-                           ("const", fc), ("get", R, C)),
+                         ("if", ("row_count", R, FC),
+                          ("if", ("col_count", C, FC),
+                           FC, ("get", R, C)),
                           ("get", R, C))), 1))
+                    # Symmetric fill: if cell is 0, read from mirror
+                    MR, MC = ("max_r",), ("max_c",)
+                    hypotheses.append((
+                        ("if", ("get", R, C), ("get", R, C),
+                         ("get", R, ("sub", ("sub", MC, ONE), C))), 1))
+                    hypotheses.append((
+                        ("if", ("get", R, C), ("get", R, C),
+                         ("get", ("sub", ("sub", MR, ONE), R), C)), 1))
+                    # Flood fill: if 0 and neighbor has fc, become fc (multi-pass)
+                    hypotheses.append((
+                        ("if", ("get", R, C), ("get", R, C),
+                         ("if", ("n_count", R, C, FC), FC, ("get", R, C))), 2))
+                    hypotheses.append((
+                        ("if", ("get", R, C), ("get", R, C),
+                         ("if", ("n_count", R, C, FC), FC, ("get", R, C))), 3))
+
+    # 4. For diff-size: try cropping to subregion containing non-background
+    if inp0.shape != out0.shape:
+        or0, oc0 = out0.shape
+        # Try reading input from various offsets
+        for dr in range(min(5, inp0.shape[0] - or0 + 1) if inp0.shape[0] > or0 else 1):
+            for dc in range(min(5, inp0.shape[1] - oc0 + 1) if inp0.shape[1] > oc0 else 1):
+                if dr == 0 and dc == 0:
+                    continue
+                hypotheses.append((("inp", ("add", R, ("const", dr)),
+                                          ("add", C, ("const", dc))), 1))
+
+    # 5. Geometric + recolor compositions
+    if inp0.shape == out0.shape:
+        MR, MC = ("max_r",), ("max_c",)
+        flip_r = ("sub", ("sub", MR, ONE), R)
+        flip_c = ("sub", ("sub", MC, ONE), C)
+        # For each color that appears in output but not input, or changes
+        out_colors = set(out0.flat)
+        inp_colors = set(inp0.flat)
+        for x in inp_colors:
+            for y in out_colors:
+                if x == y:
+                    continue
+                # Recolor + flip: if flipped cell == x, then y
+                hypotheses.append((
+                    ("if", ("eq", ("get", flip_r, C), ("const", x)),
+                     ("const", y), ("get", R, C)), 1))
+                hypotheses.append((
+                    ("if", ("eq", ("get", R, flip_c), ("const", x)),
+                     ("const", y), ("get", R, C)), 1))
+                # If cell == x AND n_count == 0 (isolated), recolor to y
+                hypotheses.append((
+                    ("if", ("eq", ("get", R, C), ("const", x)),
+                     ("if", ("n_count", R, C, ("const", x)),
+                      ("get", R, C), ("const", y)),
+                     ("get", R, C)), 1))
 
     return hypotheses
 
@@ -685,6 +791,43 @@ def evolve(tasks, rounds, library, tasks_per_round=30):
     n_near = sum(1 for v in best_fit.values() if v[2] > 0.8)
     print(f"Seed sweep: {len(solved)}/{len(tasks)} solved, "
           f"{n_near} near, lib={len(library)}")
+
+    # Phase 1.5: refine high-fitness near-misses from seed sweep
+    refine_count = 0
+    near_misses = [(tid, t, p, f) for tid, (t, p, f) in best_fit.items() if f > 0.7]
+    near_misses.sort(key=lambda x: -x[3])
+    for tid, t, p, f in near_misses[:80]:
+        examples = tasks[tid]["train"]
+        # Try node-level refinement
+        for _ in range(3):
+            t2, f2 = refine(t, examples, library, p)
+            if f2 <= f:
+                break
+            t, f = t2, f2
+            if solves(t, examples, library, p):
+                t = simplify(t, examples, library, p)
+                solved[tid] = (t, p)
+                refine_count += 1
+                p_str = f" x{p}" if p > 1 else ""
+                print(f"  ✓ {tid}{p_str} (refined): {gp.to_str(t)}")
+                break
+        # Try wrapping with n_count conditions
+        if tid not in solved and f > 0.8:
+            t2, f2 = refine_wrap(t, examples, library, p)
+            if f2 > f:
+                t, f = t2, f2
+                if solves(t, examples, library, p):
+                    t = simplify(t, examples, library, p)
+                    solved[tid] = (t, p)
+                    refine_count += 1
+                    p_str = f" x{p}" if p > 1 else ""
+                    print(f"  ✓ {tid}{p_str} (wrapped): {gp.to_str(t)}")
+        if tid not in solved:
+            best_fit[tid] = (t, p, f)
+    if refine_count:
+        print(f"Refinement: +{refine_count} solved")
+        if len(solved) >= MIN_SHARED_SOLVERS:
+            abstract(list(solved.values()), library)
 
     # Phase 2: evolutionary search — bigger budget on fewer tasks
     for rnd in range(1, rounds + 1):
