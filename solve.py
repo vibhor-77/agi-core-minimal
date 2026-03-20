@@ -14,12 +14,22 @@ import json, sys, os, numpy as np
 from pathlib import Path
 
 # ── Domain: ARC-AGI-1 ────────────────────────────────────────────────
+def _grav_down(g):
+    """Slide non-zero cells to the bottom of each column."""
+    out = np.zeros_like(g)
+    for c in range(g.shape[1]):
+        vals = g[:, c][g[:, c] != 0]
+        if len(vals) > 0:
+            out[-len(vals):, c] = vals
+    return out.tolist()
+
 primitives = {
     "rotate_cw":  lambda g: np.rot90(g, k=-1).tolist(),
     "rotate_ccw": lambda g: np.rot90(g, k=1).tolist(),
     "flip_h":     lambda g: np.fliplr(g).tolist(),
     "flip_v":     lambda g: np.flipud(g).tolist(),
     "transpose":  lambda g: np.transpose(g).tolist(),
+    "grav_down":  lambda g: _grav_down(np.array(g)),
 }
 
 _prim_score = {}  # primitive name -> cumulative usefulness
@@ -41,13 +51,19 @@ def execute(program, grid):
 
 # ── Pillar 1: Feedback Loops (continuous error signal) ───────────────
 def error(program, examples):
-    """Score: 0.0 = solves all, 1.0 = total failure. Cell-level granularity."""
+    """Score on cells that actually change (input != output). Ignore background."""
     total = 0.0
     for inp, out in examples:
         got = execute(program, inp)
-        out, got = np.array(out), np.array(got)
-        if out.shape == got.shape:
-            total += np.mean(out == got)
+        inp_a, out_a, got_a = np.array(inp), np.array(out), np.array(got)
+        if out_a.shape != got_a.shape:
+            continue
+        changed = inp_a != out_a
+        n_changed = changed.sum()
+        if n_changed == 0:
+            total += float(np.array_equal(out_a, got_a))
+        else:
+            total += np.mean(got_a[changed] == out_a[changed])
     return 1.0 - total / len(examples)
 
 # ── Pillar 4: Exploration (search by composing primitives) ───────────
@@ -88,11 +104,15 @@ def abstract(scored_programs):
 def learn(tasks, rounds):
     """The compounding cycle: explore → feedback → abstract → repeat.
     Pillar 2 (Approximability) lives in the loop: we keep the best program
-    per task regardless of whether it solved, so near-misses feed abstraction."""
+    per task regardless of whether it solved, so near-misses feed abstraction.
+    Cross-round extension: each round tries extending the previous best program
+    by prepending/appending one primitive — this is the compounding engine."""
+    best_so_far = {}  # tid -> (prog, err) — persists across rounds
     for r in range(1, rounds + 1):
         solved, best_programs = 0, []
         for tid, examples in tasks.items():
-            best_err, best_prog = 1.0, None
+            best_err = best_so_far[tid][1] if tid in best_so_far else 1.0
+            best_prog = best_so_far[tid][0] if tid in best_so_far else None
             # Pillar 4: Exploration — try all compositions
             for prog in candidates(max_depth=2):
                 # Pillar 1: Feedback — score each candidate
@@ -103,8 +123,23 @@ def learn(tasks, rounds):
                         solved += 1
                         print(f"  ✓ {tid} solved by {prog}")
                         break
+            # Extension: try prepending/appending one primitive to previous best
+            if best_err > 0.0 and tid in best_so_far:
+                prev = best_so_far[tid][0]
+                for name in primitives:
+                    for ext in ([name] + prev, prev + [name]):
+                        err = error(ext, examples)
+                        if err < best_err:
+                            best_err, best_prog = err, ext
+                            if err == 0.0:
+                                solved += 1
+                                print(f"  ✓ {tid} solved by {ext} (extended)")
+                                break
+                    if best_err == 0.0:
+                        break
             # Pillar 2: Approximability — keep best even if imperfect
             if best_prog:
+                best_so_far[tid] = (best_prog, best_err)
                 best_programs.append((best_prog, 1.0 - best_err))
         # Update primitive scores based on usefulness
         for prog, quality in best_programs:
