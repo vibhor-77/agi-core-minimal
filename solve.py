@@ -346,9 +346,14 @@ def search(examples, seed=None, seed_passes=1, library=None,
 
         pop = new_pop
 
-    # Neighborhood refinement
-    if np.random.random() < best_f:
-        best_t, best_f = refine(best_t, examples, library, best_p)
+    # Iterative refinement: try single-node edits, then refine the result
+    if best_f > 0.5:
+        t2, f2 = refine(best_t, examples, library, best_p)
+        if f2 > best_f:
+            best_t, best_f = t2, f2
+            # If first refinement improved, try again (finds 2-edit solutions)
+            if best_f < 1.0:
+                best_t, best_f = refine(best_t, examples, library, best_p)
     return best_t, best_p, best_f
 
 
