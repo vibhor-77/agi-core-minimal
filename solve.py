@@ -179,6 +179,25 @@ def make_seeds():
             ("if", ("get", R, C), ("const", y), ("get", R, C)),
             1
         ))
+    # Conditional geometry: if cell == X, read from flipped position
+    for x in range(gp.NUM_COLORS):
+        # if cell == x, flip_h, else identity
+        seeds.append((
+            ("if", ("eq", ("get", R, C), ("const", x)),
+             ("get", R, flip_c), ("get", R, C)),
+            1
+        ))
+        # if cell == x, flip_v, else identity
+        seeds.append((
+            ("if", ("eq", ("get", R, C), ("const", x)),
+             ("get", flip_r, C), ("get", R, C)),
+            1
+        ))
+    # Zero-fill: if cell == 0, read from neighbor (gravity-like, 2 passes)
+    seeds.append((("if", ("get", R, C), ("get", R, C),
+                   ("get", ("sub", R, ONE), C)), 2))
+    seeds.append((("if", ("get", R, C), ("get", R, C),
+                   ("get", ("add", R, ONE), C)), 2))
 
     # Multi-pass templates: neighbor-aware rules (2-3 passes)
     # "If any neighbor has color X, become X" — flood-fill-like
