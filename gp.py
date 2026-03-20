@@ -55,7 +55,7 @@ MAX_EVAL_NODES = 2 ** (MAX_TREE_DEPTH + 1)
 TOURNAMENT_K = 4
 
 # Mutation operator weights (relative, normalized internally).
-MUTATE_WEIGHTS = {"subtree": 5, "point": 3, "hoist": 2}
+MUTATE_WEIGHTS = {"subtree": 4, "point": 3, "hoist": 2, "graft": 3}
 _MUTATE_TOTAL = sum(MUTATE_WEIGHTS.values())
 
 
@@ -79,6 +79,20 @@ ARITY = {
     "obj_id": 2, "obj_size": 2, "obj_color": 2,       # component identity
     "obj_top": 2, "obj_left": 2, "obj_bottom": 2, "obj_right": 2,  # bounding box
 }
+
+_OBJ_OPS = {"obj_id", "obj_size", "obj_color", "obj_top", "obj_left", "obj_bottom", "obj_right"}
+_OBJ_TERMINALS = {"obj_count", "max_obj_size"}
+
+def uses_obj(tree):
+    """Check if tree references any obj_* op or terminal."""
+    op = tree[0]
+    if op in _OBJ_OPS or op in _OBJ_TERMINALS:
+        return True
+    if op == "lib":
+        return True  # conservative: library entries might use obj
+    if op in ARITY:
+        return any(uses_obj(tree[i]) for i in range(1, 1 + ARITY[op]))
+    return False
 
 
 def random_tree(max_depth=4, depth=0, library=None):
@@ -155,6 +169,73 @@ def replace(tree, path, new):
 
 # ── Evaluation ───────────────────────────────────────────────────────
 
+_ccl_cache = {}  # grid_bytes -> (label_map, obj_maps, OBJ_COUNT, MAX_OBJ_SIZE)
+
+def _get_ccl(g_original):
+    """Compute and cache connected component labeling for a grid."""
+    key = g_original.tobytes()
+    if key not in _ccl_cache:
+        orig_r, orig_c = g_original.shape
+        _label_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+        _comp_size = {}
+        _comp_color = {}
+        _comp_top = {}; _comp_left = {}; _comp_bottom = {}; _comp_right = {}
+        _next_label = 1
+        for _sr in range(orig_r):
+            for _sc in range(orig_c):
+                if _label_map[_sr, _sc] != 0 or g_original[_sr, _sc] == 0:
+                    continue
+                _color = int(g_original[_sr, _sc])
+                _lbl = _next_label; _next_label += 1
+                _queue = [(_sr, _sc)]
+                _label_map[_sr, _sc] = _lbl
+                _sz = 0; _t = _sr; _l = _sc; _b = _sr; _ri = _sc
+                _qi = 0
+                while _qi < len(_queue):
+                    _qr, _qc = _queue[_qi]; _qi += 1
+                    _sz += 1
+                    if _qr < _t: _t = _qr
+                    if _qr > _b: _b = _qr
+                    if _qc < _l: _l = _qc
+                    if _qc > _ri: _ri = _qc
+                    for _dr, _dc in ((-1,0),(1,0),(0,-1),(0,1)):
+                        _nr, _nc = _qr+_dr, _qc+_dc
+                        if 0 <= _nr < orig_r and 0 <= _nc < orig_c and _label_map[_nr, _nc] == 0 and g_original[_nr, _nc] == _color:
+                            _label_map[_nr, _nc] = _lbl
+                            _queue.append((_nr, _nc))
+                _comp_size[_lbl] = _sz
+                _comp_color[_lbl] = _color
+                _comp_top[_lbl] = _t; _comp_left[_lbl] = _l
+                _comp_bottom[_lbl] = _b; _comp_right[_lbl] = _ri
+
+        _obj_size_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+        _obj_color_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+        _obj_top_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+        _obj_left_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+        _obj_bottom_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+        _obj_right_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+        for _lbl in _comp_size:
+            _mask = _label_map == _lbl
+            _obj_size_map[_mask] = _comp_size[_lbl]
+            _obj_color_map[_mask] = _comp_color[_lbl]
+            _obj_top_map[_mask] = _comp_top[_lbl]
+            _obj_left_map[_mask] = _comp_left[_lbl]
+            _obj_bottom_map[_mask] = _comp_bottom[_lbl]
+            _obj_right_map[_mask] = _comp_right[_lbl]
+
+        OBJ_COUNT = np.int64(len(_comp_size))
+        MAX_OBJ_SIZE = np.int64(max(_comp_size.values())) if _comp_size else np.int64(0)
+        _obj_maps = {
+            "obj_id": _label_map, "obj_size": _obj_size_map, "obj_color": _obj_color_map,
+            "obj_top": _obj_top_map, "obj_left": _obj_left_map,
+            "obj_bottom": _obj_bottom_map, "obj_right": _obj_right_map,
+        }
+        _ccl_cache[key] = (_label_map, _obj_maps, OBJ_COUNT, MAX_OBJ_SIZE)
+        if len(_ccl_cache) > 500:
+            _ccl_cache.pop(next(iter(_ccl_cache)))
+    return _ccl_cache[key]
+
+
 def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
     """Evaluate tree once for all output cells. Returns 2D int array or None."""
     cur_r, cur_c = g_current.shape
@@ -199,62 +280,13 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
         global_hist[v] = (g_original == v).sum()
     MODE_COLOR = np.int64(np.argmax(global_hist))
 
-    # ── Connected component labeling (BFS on g_original, same-color 4-connectivity) ──
-    _label_map = np.zeros((orig_r, orig_c), dtype=np.int64)
-    _comp_size = {}   # label -> cell count
-    _comp_color = {}  # label -> color
-    _comp_top = {}; _comp_left = {}; _comp_bottom = {}; _comp_right = {}
-    _next_label = 1
-    for _sr in range(orig_r):
-        for _sc in range(orig_c):
-            if _label_map[_sr, _sc] != 0 or g_original[_sr, _sc] == 0:
-                continue
-            _color = int(g_original[_sr, _sc])
-            _lbl = _next_label; _next_label += 1
-            _queue = [(_sr, _sc)]
-            _label_map[_sr, _sc] = _lbl
-            _sz = 0; _t = _sr; _l = _sc; _b = _sr; _ri = _sc
-            _qi = 0
-            while _qi < len(_queue):
-                _qr, _qc = _queue[_qi]; _qi += 1
-                _sz += 1
-                if _qr < _t: _t = _qr
-                if _qr > _b: _b = _qr
-                if _qc < _l: _l = _qc
-                if _qc > _ri: _ri = _qc
-                for _dr, _dc in ((-1,0),(1,0),(0,-1),(0,1)):
-                    _nr, _nc = _qr+_dr, _qc+_dc
-                    if 0 <= _nr < orig_r and 0 <= _nc < orig_c and _label_map[_nr, _nc] == 0 and g_original[_nr, _nc] == _color:
-                        _label_map[_nr, _nc] = _lbl
-                        _queue.append((_nr, _nc))
-            _comp_size[_lbl] = _sz
-            _comp_color[_lbl] = _color
-            _comp_top[_lbl] = _t; _comp_left[_lbl] = _l
-            _comp_bottom[_lbl] = _b; _comp_right[_lbl] = _ri
-
-    # Build lookup maps
-    _obj_size_map = np.zeros((orig_r, orig_c), dtype=np.int64)
-    _obj_color_map = np.zeros((orig_r, orig_c), dtype=np.int64)
-    _obj_top_map = np.zeros((orig_r, orig_c), dtype=np.int64)
-    _obj_left_map = np.zeros((orig_r, orig_c), dtype=np.int64)
-    _obj_bottom_map = np.zeros((orig_r, orig_c), dtype=np.int64)
-    _obj_right_map = np.zeros((orig_r, orig_c), dtype=np.int64)
-    for _lbl in _comp_size:
-        _mask = _label_map == _lbl
-        _obj_size_map[_mask] = _comp_size[_lbl]
-        _obj_color_map[_mask] = _comp_color[_lbl]
-        _obj_top_map[_mask] = _comp_top[_lbl]
-        _obj_left_map[_mask] = _comp_left[_lbl]
-        _obj_bottom_map[_mask] = _comp_bottom[_lbl]
-        _obj_right_map[_mask] = _comp_right[_lbl]
-
-    OBJ_COUNT = np.int64(len(_comp_size))
-    MAX_OBJ_SIZE = np.int64(max(_comp_size.values())) if _comp_size else np.int64(0)
-    _obj_maps = {
-        "obj_id": _label_map, "obj_size": _obj_size_map, "obj_color": _obj_color_map,
-        "obj_top": _obj_top_map, "obj_left": _obj_left_map,
-        "obj_bottom": _obj_bottom_map, "obj_right": _obj_right_map,
-    }
+    # ── Connected component labeling (cached, only if tree uses obj_* ops) ──
+    if uses_obj(tree):
+        _label_map, _obj_maps, OBJ_COUNT, MAX_OBJ_SIZE = _get_ccl(g_original)
+    else:
+        _obj_maps = {}
+        OBJ_COUNT = np.int64(0)
+        MAX_OBJ_SIZE = np.int64(0)
 
     def _eval(node):
         node_count[0] += 1
@@ -360,8 +392,47 @@ def crossover(p1, p2):
     return child if depth(child) <= MAX_TREE_DEPTH else p1
 
 
+def _random_condition():
+    """Generate a biased-random condition for graft mutation."""
+    R, C = ("r",), ("c",)
+    k = np.random.randint(NUM_COLORS)
+    K = ("const", k)
+    k2 = np.random.randint(1, 5)
+    K2 = ("const", k2)
+    v = np.random.randint(NUM_COLORS)
+    V = ("const", v)
+
+    if np.random.random() < 0.6:
+        # Template-based condition
+        templates = [
+            # Position
+            ("gt", R, K),
+            ("gt", C, K),
+            ("eq", ("mod", R, ("const", 2)), ("const", 0)),
+            ("eq", ("mod", C, ("const", 2)), ("const", 0)),
+            ("eq", ("mod", ("add", R, C), ("const", 2)), ("const", 0)),
+            # Value
+            ("eq", ("get", R, C), K),
+            ("gt", ("get", R, C), ("const", 0)),
+            ("eq", ("inp", R, C), K),
+            # Neighbor
+            ("gt", ("n_count", R, C, V), K2),
+            ("eq", ("n_count", R, C, V), ("const", 0)),
+            # Object
+            ("gt", ("obj_size", R, C), K2),
+            ("eq", ("obj_color", R, C), K),
+            ("eq", ("obj_size", R, C), K2),
+            # Row/col
+            ("gt", ("row_count", R, V), ("const", 0)),
+            ("gt", ("col_count", C, V), ("const", 0)),
+        ]
+        return templates[np.random.randint(len(templates))]
+    else:
+        return random_tree(max_depth=3)
+
+
 def mutate(tree, library=None):
-    """Apply one random mutation: subtree, point, or hoist."""
+    """Apply one random mutation: subtree, point, hoist, or graft."""
     r = np.random.random() * _MUTATE_TOTAL
     subs = subtrees(tree)
     path, node = subs[np.random.randint(len(subs))]
@@ -386,11 +457,25 @@ def mutate(tree, library=None):
             return replace(tree, path, (new_op, node[1], node[2]))
         return tree
 
-    # hoist: replace tree with one of its subtrees
-    if len(subs) > 1:
-        _, sub = subs[np.random.randint(1, len(subs))]
-        return sub
-    return tree
+    if r < MUTATE_WEIGHTS["subtree"] + MUTATE_WEIGHTS["point"] + MUTATE_WEIGHTS["hoist"]:
+        # hoist: replace tree with one of its subtrees
+        if len(subs) > 1:
+            _, sub = subs[np.random.randint(1, len(subs))]
+            return sub
+        return tree
+
+    # graft: wrap a random subtree in a conditional
+    remaining_depth = MAX_TREE_DEPTH - len(path) - 2
+    if remaining_depth < 1:
+        return tree
+    condition = _random_condition()
+    alternative = random_tree(max_depth=min(remaining_depth, 3), library=library)
+    if np.random.random() < 0.5:
+        grafted = ("if", condition, node, alternative)
+    else:
+        grafted = ("if", condition, alternative, node)
+    result = replace(tree, path, grafted)
+    return result if depth(result) <= MAX_TREE_DEPTH else tree
 
 
 def tournament(population, fitnesses, k=TOURNAMENT_K):

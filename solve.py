@@ -17,8 +17,8 @@ import gp
 # ── Constants ────────────────────────────────────────────────────────
 
 # Search budget (base values — actual budget scales continuously with fitness)
-POP_SIZE_BASE = 60              # population at fitness=0; doubles at fitness=1
-GENERATIONS_BASE = 12           # generations at fitness=0; doubles at fitness=1
+POP_SIZE_BASE = 120             # population at fitness=0; doubles at fitness=1
+GENERATIONS_BASE = 20           # generations at fitness=0; doubles at fitness=1
 ELITE_FRACTION = 5              # keep top 1/N of population as elite
 
 # Fitness function
@@ -534,6 +534,11 @@ def search(examples, seed=None, seed_passes=1, library=None,
             best_t, best_f = t2, f2
             if best_f >= 1.0:
                 break
+    # Error-driven refinement for high-fitness near-misses
+    if 0.5 < best_f < 1.0:
+        t2, f2 = error_driven_refine(best_t, examples, library, best_p)
+        if f2 > best_f:
+            best_t, best_f = t2, f2
     return best_t, best_p, best_f
 
 
@@ -647,6 +652,227 @@ def refine_wrap(tree, examples, library=None, passes=1):
                     f = fitness(c, examples, library, passes)
                     if f > best_f:
                         best_t, best_f = c, f
+
+    return best_t, best_f
+
+
+def error_driven_refine(tree, examples, library=None, passes=1):
+    """Targeted fix for near-miss programs: find discriminating conditions at error cells.
+
+    1. Compute error mask across all training examples
+    2. Find conditions that are True at ALL error cells and False at ALL correct cells (or vice versa)
+    3. Try wrapping tree (or subtrees) with if(condition, fix_value, tree)
+    """
+    if not solves(tree, examples[:1], library, passes) is False:
+        # Quick check: if it already works on first example, nothing to do
+        pass
+
+    R, C = ("r",), ("c",)
+    ONE = ("const", 1)
+    MR, MC = ("max_r",), ("max_c",)
+    flip_r = ("sub", ("sub", MR, ONE), R)
+    flip_c = ("sub", ("sub", MC, ONE), C)
+
+    # Collect error info across all examples
+    all_conditions_work = True  # track if conditions are consistent across examples
+    candidate_fixes = []  # list of (condition_tree, fix_tree) that work on ALL examples
+
+    # First, gather error masks and properties for each example
+    example_data = []
+    for inp, out in examples:
+        inp_a = np.asarray(inp)
+        out_a = np.asarray(out)
+        got = gp.evaluate(tree, inp_a, out_a.shape, library, passes=passes)
+        if got is None or got.shape != out_a.shape:
+            return tree, fitness(tree, examples, library, passes)
+        error_mask = got != out_a
+        if not error_mask.any():
+            example_data.append(None)
+            continue
+        example_data.append({
+            "inp": inp_a, "out": out_a, "got": got,
+            "error_mask": error_mask,
+            "error_rows": set(np.where(error_mask)[0].tolist()),
+            "error_cols": set(np.where(error_mask)[1].tolist()),
+            "expected_at_errors": out_a[error_mask],
+            "got_at_errors": got[error_mask],
+        })
+
+    if all(d is None for d in example_data):
+        return tree, 1.0  # already solves
+
+    # Build candidate conditions based on first non-None example
+    ref = next(d for d in example_data if d is not None)
+    h, w = ref["out"].shape
+    conditions = []  # list of (name, condition_tree)
+
+    # Row conditions
+    for k in sorted(ref["error_rows"])[:5]:
+        conditions.append((f"r=={k}", ("eq", R, ("const", k))))
+    for k in sorted(ref["error_rows"])[:3]:
+        conditions.append((f"r>{k}", ("gt", R, ("const", k))))
+    # Also try boundaries: rows just before/after error region
+    err_rows = sorted(ref["error_rows"])
+    if err_rows:
+        if err_rows[0] > 0:
+            conditions.append((f"r>={err_rows[0]}", ("gt", R, ("const", err_rows[0] - 1))))
+        conditions.append((f"r<={err_rows[-1]}", ("gt", ("const", err_rows[-1] + 1), R)))
+
+    # Column conditions
+    for k in sorted(ref["error_cols"])[:5]:
+        conditions.append((f"c=={k}", ("eq", C, ("const", k))))
+    for k in sorted(ref["error_cols"])[:3]:
+        conditions.append((f"c>{k}", ("gt", C, ("const", k))))
+    err_cols = sorted(ref["error_cols"])
+    if err_cols:
+        if err_cols[0] > 0:
+            conditions.append((f"c>={err_cols[0]}", ("gt", C, ("const", err_cols[0] - 1))))
+        conditions.append((f"c<={err_cols[-1]}", ("gt", ("const", err_cols[-1] + 1), C)))
+
+    # Modular conditions
+    conditions.append(("(r+c)%2==0", ("eq", ("mod", ("add", R, C), ("const", 2)), ("const", 0))))
+    conditions.append(("(r+c)%2==1", ("eq", ("mod", ("add", R, C), ("const", 2)), ("const", 1))))
+    conditions.append(("r%2==0", ("eq", ("mod", R, ("const", 2)), ("const", 0))))
+    conditions.append(("c%2==0", ("eq", ("mod", C, ("const", 2)), ("const", 0))))
+
+    # Input value conditions
+    inp_colors = set(ref["inp"].flat)
+    for k in inp_colors:
+        conditions.append((f"inp=={k}", ("eq", ("inp", R, C), ("const", int(k)))))
+
+    # Neighbor conditions
+    for v in list(inp_colors)[:5]:
+        for nk in range(5):
+            conditions.append((f"nc({v})>{nk}", ("gt", ("n_count", R, C, ("const", int(v))), ("const", nk))))
+            if nk <= 2:
+                conditions.append((f"nc({v})=={nk}", ("eq", ("n_count", R, C, ("const", int(v))), ("const", nk))))
+
+    # Object conditions (only evaluate if obj ops might help)
+    try:
+        obj_size_vals = gp.evaluate(("obj_size", R, C), ref["inp"], ref["out"].shape, library)
+        obj_color_vals = gp.evaluate(("obj_color", R, C), ref["inp"], ref["out"].shape, library)
+        obj_top_vals = gp.evaluate(("obj_top", R, C), ref["inp"], ref["out"].shape, library)
+        obj_left_vals = gp.evaluate(("obj_left", R, C), ref["inp"], ref["out"].shape, library)
+        if obj_size_vals is not None:
+            for sz in sorted(set(obj_size_vals[obj_size_vals > 0].flat))[:5]:
+                conditions.append((f"osz=={sz}", ("eq", ("obj_size", R, C), ("const", int(sz)))))
+                conditions.append((f"osz>{sz}", ("gt", ("obj_size", R, C), ("const", int(sz)))))
+        if obj_color_vals is not None:
+            for oc in sorted(set(obj_color_vals[obj_color_vals > 0].flat))[:5]:
+                conditions.append((f"ocol=={oc}", ("eq", ("obj_color", R, C), ("const", int(oc)))))
+        if obj_top_vals is not None:
+            conditions.append(("otop==0", ("eq", ("obj_top", R, C), ("const", 0))))
+            conditions.append(("r==otop", ("eq", R, ("obj_top", R, C))))
+        if obj_left_vals is not None:
+            conditions.append(("oleft==0", ("eq", ("obj_left", R, C), ("const", 0))))
+            conditions.append(("c==oleft", ("eq", C, ("obj_left", R, C))))
+    except Exception:
+        pass
+
+    # Row/col count conditions
+    for v in list(inp_colors)[:4]:
+        conditions.append((f"rc({v})>0", ("gt", ("row_count", R, ("const", int(v))), ("const", 0))))
+        conditions.append((f"cc({v})>0", ("gt", ("col_count", C, ("const", int(v))), ("const", 0))))
+
+    # Now evaluate each condition against error masks
+    # For each condition, check if it discriminates errors from correct cells
+    best_t, best_f = tree, fitness(tree, examples, library, passes)
+
+    for _cname, cond_tree in conditions:
+        # Check discrimination on each example
+        cond_true_at_errors = True
+        cond_false_at_correct = True
+        cond_inv = True  # inverse: cond False at errors, True at correct
+        cond_inv_correct = True
+
+        for ed in example_data:
+            if ed is None:
+                continue
+            cond_val = gp.evaluate(cond_tree, ed["inp"], ed["out"].shape, library)
+            if cond_val is None:
+                cond_true_at_errors = False
+                cond_inv = False
+                break
+            cond_bool = cond_val != 0
+            em = ed["error_mask"]
+            if not cond_bool[em].all():
+                cond_true_at_errors = False
+            if cond_bool[~em].any():
+                cond_false_at_correct = False
+            # Inverse
+            if cond_bool[em].any():
+                cond_inv = False
+            if not cond_bool[~em].all():
+                cond_inv_correct = False
+
+        # Try both orientations
+        orientations = []
+        if cond_true_at_errors and cond_false_at_correct:
+            orientations.append(True)   # if(cond, fix, tree)
+        if cond_inv and cond_inv_correct:
+            orientations.append(False)  # if(cond, tree, fix)
+
+        if not orientations:
+            continue
+
+        # Try fix values
+        fix_values = [("const", i) for i in range(gp.NUM_COLORS)]
+        fix_values.append(("inp", R, C))
+        fix_values.append(("get", flip_r, C))
+        fix_values.append(("get", R, flip_c))
+
+        # Check if expected output at error cells is consistent
+        consistent_expected = True
+        expected_val = None
+        for ed in example_data:
+            if ed is None:
+                continue
+            unique_expected = set(ed["expected_at_errors"].flat)
+            if len(unique_expected) == 1:
+                v = unique_expected.pop()
+                if expected_val is None:
+                    expected_val = v
+                elif expected_val != v:
+                    consistent_expected = False
+            else:
+                consistent_expected = False
+
+        for orient in orientations:
+            for fix in fix_values:
+                if orient:
+                    candidate = ("if", cond_tree, fix, tree)
+                else:
+                    candidate = ("if", cond_tree, tree, fix)
+                if gp.depth(candidate) > gp.MAX_TREE_DEPTH:
+                    continue
+                if solves(candidate, examples, library, passes):
+                    return simplify(candidate, examples, library, passes), 1.0
+                f = fitness(candidate, examples, library, passes)
+                if f > best_f:
+                    best_t, best_f = candidate, f
+
+    # Also try subtree-level wrapping for smaller fixes
+    for path, sub in gp.subtrees(tree):
+        if not path or gp.size(sub) < 2:
+            continue
+        if len(path) + gp.depth(sub) + 3 > gp.MAX_TREE_DEPTH:
+            continue
+        # Check if this subtree produces consistent wrong values at error positions
+        # Only try top-3 discriminating conditions (to keep cost bounded)
+        for _cname, cond_tree in conditions[:15]:
+            for fix_val in [("const", i) for i in range(gp.NUM_COLORS)][:5] + [("inp", R, C)]:
+                wrapped = ("if", cond_tree, fix_val, sub)
+                candidate = gp.replace(tree, path, wrapped)
+                if gp.depth(candidate) > gp.MAX_TREE_DEPTH:
+                    continue
+                if solves(candidate, examples, library, passes):
+                    return simplify(candidate, examples, library, passes), 1.0
+                f = fitness(candidate, examples, library, passes)
+                if f > best_f:
+                    best_t, best_f = candidate, f
+        # Limit subtree iterations for performance
+        if gp.size(tree) > 15:
+            break
 
     return best_t, best_f
 
@@ -985,6 +1211,11 @@ def seed_sweep(tasks, library):
         t2, f2 = refine(t, examples, library, p)
         if f2 > f:
             t, f = t2, f2
+        if not solves(t, examples, library, p) and f > 0.85:
+            # Try error-driven refinement
+            t2, f2 = error_driven_refine(t, examples, library, p)
+            if f2 > f:
+                t, f = t2, f2
         if solves(t, examples, library, p):
             t = simplify(t, examples, library, p)
             solved[tid] = (t, p)
@@ -1000,7 +1231,7 @@ def seed_sweep(tasks, library):
     return solved, best_fit
 
 
-def evolve(tasks, rounds, library, tasks_per_round=30):
+def evolve(tasks, rounds, library, tasks_per_round=50):
     """Per-task evolution with cross-task abstraction.
 
     Phase 1: fast seed sweep on all tasks (finds tasks solvable by templates).
@@ -1018,7 +1249,7 @@ def evolve(tasks, rounds, library, tasks_per_round=30):
     refine_count = 0
     near_misses = [(tid, t, p, f) for tid, (t, p, f) in best_fit.items() if f > 0.7]
     near_misses.sort(key=lambda x: -x[3])
-    for tid, t, p, f in near_misses[:60]:
+    for tid, t, p, f in near_misses[:100]:
         examples = tasks[tid]["train"]
         # Multi-round node-level refinement
         for _ in range(3):
@@ -1044,6 +1275,17 @@ def evolve(tasks, rounds, library, tasks_per_round=30):
                     refine_count += 1
                     p_str = f" x{p}" if p > 1 else ""
                     print(f"  ✓ {tid}{p_str} (wrapped): {gp.to_str(t)}")
+        # Try error-driven refinement
+        if tid not in solved and f > 0.8:
+            t2, f2 = error_driven_refine(t, examples, library, p)
+            if f2 > f:
+                t, f = t2, f2
+                if solves(t, examples, library, p):
+                    t = simplify(t, examples, library, p)
+                    solved[tid] = (t, p)
+                    refine_count += 1
+                    p_str = f" x{p}" if p > 1 else ""
+                    print(f"  ✓ {tid}{p_str} (error-refined): {gp.to_str(t)}")
         if tid not in solved:
             best_fit[tid] = (t, p, f)
     if refine_count:
