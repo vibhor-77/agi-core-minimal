@@ -95,6 +95,7 @@ def simplify(tree, examples, library=None, passes=1):
     R, C = ("r",), ("c",)
     replacements = [
         R, C, ("max_r",), ("max_c",), ("inp_r",), ("inp_c",), ("mode_color",),
+        ("obj_count",), ("max_obj_size",),
         IDENTITY, ("get", C, R),
         ("inp", ("r",), ("c",)),                                   # inp(r,c)
         ("sub", ("sub", ("max_r",), ("const", 1)), R),
@@ -350,6 +351,64 @@ def make_seeds():
     # Majority fill: if cell is 0, become mode_color
     seeds.append((("if", ("get", R, C), ("get", R, C), ("mode_color",)), 1))
 
+    # ── Object (connected component) seeds ─────────────────────────────
+    # Keep largest object
+    seeds.append((("if", ("eq", ("obj_size", R, C), ("max_obj_size",)),
+                   ("get", R, C), ("const", 0)), 1))
+    # Remove largest object
+    seeds.append((("if", ("eq", ("obj_size", R, C), ("max_obj_size",)),
+                   ("const", 0), ("get", R, C)), 1))
+    # Keep objects of size N (N=1..5)
+    for n in range(1, 6):
+        seeds.append((("if", ("eq", ("obj_size", R, C), ("const", n)),
+                       ("get", R, C), ("const", 0)), 1))
+    # Remove isolated pixels (size==1)
+    seeds.append((("if", ("gt", ("obj_size", R, C), ("const", 1)),
+                   ("get", R, C), ("const", 0)), 1))
+    # Keep only object N (N=1..3)
+    for n in range(1, 4):
+        seeds.append((("if", ("eq", ("obj_id", R, C), ("const", n)),
+                       ("get", R, C), ("const", 0)), 1))
+    # Recolor all objects to single color
+    for color in range(1, 5):
+        seeds.append((("if", ("obj_id", R, C), ("const", color), ("const", 0)), 1))
+    # Keep objects touching top edge (obj_top == 0)
+    seeds.append((("if", ("eq", ("obj_top", R, C), ("const", 0)),
+                   ("get", R, C), ("const", 0)), 1))
+    # Keep objects touching left edge (obj_left == 0)
+    seeds.append((("if", ("eq", ("obj_left", R, C), ("const", 0)),
+                   ("get", R, C), ("const", 0)), 1))
+    # Remove objects touching top/left edge
+    seeds.append((("if", ("eq", ("obj_top", R, C), ("const", 0)),
+                   ("const", 0), ("get", R, C)), 1))
+    seeds.append((("if", ("eq", ("obj_left", R, C), ("const", 0)),
+                   ("const", 0), ("get", R, C)), 1))
+    # Fill bounding box of each object with its color
+    seeds.append((("if", ("obj_id", R, C), ("obj_color", R, C), ("const", 0)), 1))
+    # Keep objects of specific color (color 1-5)
+    for color in range(1, 6):
+        seeds.append((("if", ("eq", ("obj_color", R, C), ("const", color)),
+                       ("get", R, C), ("const", 0)), 1))
+        # Remove objects of specific color
+        seeds.append((("if", ("eq", ("obj_color", R, C), ("const", color)),
+                       ("const", 0), ("get", R, C)), 1))
+    # Keep largest + recolor to specific color
+    for color in range(1, 5):
+        seeds.append((("if", ("eq", ("obj_size", R, C), ("max_obj_size",)),
+                       ("const", color), ("const", 0)), 1))
+    # Keep non-largest objects
+    seeds.append((("if", ("eq", ("obj_size", R, C), ("max_obj_size",)),
+                   ("const", 0), ("if", ("obj_id", R, C), ("get", R, C), ("const", 0))), 1))
+    # Size thresholding: keep objects with size > N
+    for n in range(2, 6):
+        seeds.append((("if", ("gt", ("obj_size", R, C), ("const", n)),
+                       ("get", R, C), ("const", 0)), 1))
+    # Remove objects touching bottom/right edge
+    seeds.append((("if", ("eq", ("obj_bottom", R, C), ("sub", MR, ONE)),
+                   ("const", 0), ("get", R, C)), 1))
+    seeds.append((("if", ("eq", ("obj_right", R, C), ("sub", MC, ONE)),
+                   ("const", 0), ("get", R, C)), 1))
+
     return seeds
 
 
@@ -481,7 +540,8 @@ def search(examples, seed=None, seed_passes=1, library=None,
 def refine(tree, examples, library=None, passes=1):
     """Try all single-node edits of tree."""
     best_t, best_f = tree, fitness(tree, examples, library, passes)
-    terminals = [("r",), ("c",), ("max_r",), ("max_c",), ("inp_r",), ("inp_c",), ("mode_color",)]
+    terminals = [("r",), ("c",), ("max_r",), ("max_c",), ("inp_r",), ("inp_c",), ("mode_color",),
+                 ("obj_count",), ("max_obj_size",)]
     terminals += [("const", i) for i in range(gp.NUM_COLORS)]
     for name in (library or {}):
         terminals.append(("lib", name))
@@ -549,6 +609,44 @@ def refine_wrap(tree, examples, library=None, passes=1):
                         f = fitness(c, examples, library, passes)
                         if f > best_f:
                             best_t, best_f = c, f
+
+    # Try wrapping with obj_size conditions
+    for fc in changed_from:
+        for tv in set(out0[diff].tolist()):
+            for sz_thresh in range(1, 6):
+                for cmp_op in ["gt", "eq"]:
+                    wrapper = ("if", ("eq", tree, ("const", fc)),
+                               ("if", (cmp_op, ("obj_size", R, C),
+                                       ("const", sz_thresh)),
+                                ("const", tv), tree),
+                               tree)
+                    if gp.depth(wrapper) <= gp.MAX_TREE_DEPTH:
+                        if solves(wrapper, examples, library, passes):
+                            return simplify(wrapper, examples, library, passes), 1.0
+                        f = fitness(wrapper, examples, library, passes)
+                        if f > best_f:
+                            best_t, best_f = wrapper, f
+
+    # Try wrapping internal subtrees of obj-based trees with spatial conditions
+    # This handles cases like "keep largest object BUT only rows 3-6"
+    for path, node in gp.subtrees(tree):
+        if node == ("get", R, C) or (node[0] == "const" and node[1] != 0):
+            for cond in [
+                ("gt", R, ("obj_top", R, C)),     # r > obj_top (exclude top boundary)
+                ("gt", C, ("obj_left", R, C)),     # c > obj_left
+                ("gt", ("obj_bottom", R, C), R),   # r < obj_bottom
+                ("gt", ("obj_right", R, C), C),    # c < obj_right
+                ("gt", ("obj_size", R, C), ("const", 1)),
+                ("gt", ("obj_size", R, C), ("const", 2)),
+            ]:
+                wrapped = ("if", cond, node, ("const", 0))
+                c = gp.replace(tree, path, wrapped)
+                if gp.depth(c) <= gp.MAX_TREE_DEPTH:
+                    if solves(c, examples, library, passes):
+                        return simplify(c, examples, library, passes), 1.0
+                    f = fitness(c, examples, library, passes)
+                    if f > best_f:
+                        best_t, best_f = c, f
 
     return best_t, best_f
 
@@ -782,6 +880,69 @@ def task_hypotheses(examples):
                      ("if", ("n_count", R, C, ("const", x)),
                       ("get", R, C), ("const", y)),
                      ("get", R, C)), 1))
+
+    # 7. Object-aware hypotheses from CCL analysis on first example
+    try:
+        import gp as _gp
+        _obj_size_tree = ("obj_size", ("r",), ("c",))
+        _sizes = _gp.evaluate(_obj_size_tree, inp0)
+        _obj_id_tree = ("obj_id", ("r",), ("c",))
+        _ids = _gp.evaluate(_obj_id_tree, inp0)
+        _obj_color_tree = ("obj_color", ("r",), ("c",))
+        _colors = _gp.evaluate(_obj_color_tree, inp0)
+        if _sizes is not None and _ids is not None:
+            _unique_sizes = sorted(set(_sizes[_sizes > 0].tolist()))
+            _unique_ids = sorted(set(_ids[_ids > 0].tolist()))
+            # Keep/remove objects of each observed size
+            for sz in _unique_sizes[:6]:
+                SZ = ("const", int(sz))
+                hypotheses.append((("if", ("eq", ("obj_size", R, C), SZ),
+                                   ("get", R, C), ("const", 0)), 1))
+                hypotheses.append((("if", ("eq", ("obj_size", R, C), SZ),
+                                   ("const", 0), ("get", R, C)), 1))
+            # Try selecting each object by ID (up to 5)
+            for oid in _unique_ids[:5]:
+                hypotheses.append((("if", ("eq", ("obj_id", R, C), ("const", int(oid))),
+                                   ("get", R, C), ("const", 0)), 1))
+            # For each observed object color, try keep/remove by color
+            if _colors is not None:
+                _unique_obj_colors = sorted(set(_colors[_colors > 0].tolist()))
+                for oc in _unique_obj_colors[:5]:
+                    OC = ("const", int(oc))
+                    hypotheses.append((("if", ("eq", ("obj_color", R, C), OC),
+                                       ("get", R, C), ("const", 0)), 1))
+                    hypotheses.append((("if", ("eq", ("obj_color", R, C), OC),
+                                       ("const", 0), ("get", R, C)), 1))
+                    # Recolor objects of this color to other observed colors
+                    for oc2 in _unique_obj_colors[:5]:
+                        if oc2 != oc:
+                            hypotheses.append((("if", ("eq", ("obj_color", R, C), OC),
+                                               ("const", int(oc2)), ("get", R, C)), 1))
+            # Size-based recoloring with thresholds
+            if len(_unique_sizes) > 1 and inp0.shape == out0.shape:
+                out_colors = set(out0.flat) - {0}
+                # Compute gap thresholds (midpoints between distinct sizes)
+                _thresholds = set(_unique_sizes)
+                for i in range(len(_unique_sizes) - 1):
+                    _thresholds.add((_unique_sizes[i] + _unique_sizes[i+1]) // 2)
+                for tv in out_colors:
+                    TV = ("const", int(tv))
+                    for sz in _thresholds:
+                        SZ = ("const", int(sz))
+                        # Recolor objects of exactly this size
+                        hypotheses.append((("if", ("eq", ("obj_size", R, C), SZ),
+                                           TV, ("get", R, C)), 1))
+                        # Recolor objects larger than threshold
+                        hypotheses.append((("if", ("gt", ("obj_size", R, C), SZ),
+                                           TV, ("get", R, C)), 1))
+                        # Recolor objects smaller than/equal to threshold
+                        hypotheses.append((("if", ("gt", SZ, ("obj_size", R, C)),
+                                           TV, ("get", R, C)), 1))
+                    # Also try threshold at max_obj_size
+                    hypotheses.append((("if", ("eq", ("obj_size", R, C), ("max_obj_size",)),
+                                       TV, ("get", R, C)), 1))
+    except Exception:
+        pass
 
     return hypotheses
 

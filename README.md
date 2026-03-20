@@ -32,8 +32,9 @@ Every program is built from atomic operations plus derived perception layers:
 | **Logic** | `eq`, `gt`, `if` | Compare values and branch |
 | **Neighborhood** | `n_count(r, c, v)` | Count of 4-neighbors with color v |
 | **Aggregation** | `row_count(r, v)`, `col_count(c, v)`, `total_count(v)`, `mode_color` | Row/col/global color counts |
+| **Object** | `obj_id(r,c)`, `obj_size(r,c)`, `obj_color(r,c)`, `obj_top/left/bottom/right(r,c)`, `obj_count`, `max_obj_size` | Connected component properties |
 
-The derived primitives (neighborhood, aggregation) are **provably equivalent** to compositions of atomic ops — they're pre-computed for search tractability, analogous to how edge-detection neurons in visual cortex are compiled pixel-level operations.
+The derived primitives (neighborhood, aggregation, object) are **provably equivalent** to compositions of atomic ops — they're pre-computed for search tractability. Object primitives (connected component labeling via BFS) are pre-computed because CCL requires O(grid_diameter) passes but MAX_PASSES=5.
 
 ### The evolution loop
 
@@ -110,14 +111,15 @@ The system avoids hard cutoffs wherever possible:
 
 ### Minimal and universal
 
-The primitive set is deliberately small (11 operations) but **universal** — any computable grid transformation can be expressed. The goal is not to add domain-specific primitives but to build a mechanism that discovers useful compositions from atomic operations.
+The primitive set is deliberately small (18 function ops + 11 terminals) but **universal** — any computable grid transformation can be expressed. The goal is not to add domain-specific primitives but to build a mechanism that discovers useful compositions from atomic operations.
 
 ## Current results
 
-- **27-30/400** training tasks solved (seed sweep + refinement + 2-3 evolutionary rounds)
-- 17 library entries abstracted, reused in later solutions
-- 128 near-misses (fitness > 0.8) — the system is making partial progress on many tasks
+- **30/400** training tasks solved (seed sweep + refinement + 2 evolutionary rounds)
+- 13 library entries abstracted, reused in later solutions
+- 129 near-misses (fitness > 0.8) — the system is making partial progress on many tasks
 - Multi-pass programs discovered (2-pass gravity, 3-pass iterative refinement)
+- Object-level primitives: connected component detection enables size-based filtering, object selection
 
 ### What works
 
@@ -128,13 +130,14 @@ The primitive set is deliberately small (11 operations) but **universal** — an
 | Color recoloring | if(cell==7, 5, cell), swap 5↔8 | 5 |
 | Conditional geometry | if(cell==0, flip_v, identity) | 3 |
 | Neighbor-based | edge detection via n_count, interior detection | 3 |
+| Object-based | size filtering (`obj_size > 1`), object selection by ID, size-based recoloring | 3 |
 | Background / aggregation | mode_color detection, row_count patterns | 3 |
 | Multi-pass | gravity (propagate down), iterative fill | 3 |
 | Compositions | conditional mirror, library-based combos | 3 |
 
 ### What doesn't work (yet)
 
-The remaining ~370 tasks require **object-level reasoning** — identifying connected components, detecting patterns, counting objects, understanding spatial relationships. The derived primitives bridge part of the gap (neighborhood counting enables edge detection, row/column aggregation enables pattern detection) but most tasks need true object-level representation.
+The remaining ~370 tasks require more complex reasoning. Object primitives now enable basic component detection and size filtering, but many tasks need: shape analysis (rectangle vs. irregular), 8-connectivity grouping, relative positioning between objects, pattern matching within objects, and multi-object spatial relationships.
 
 ### Search pipeline
 

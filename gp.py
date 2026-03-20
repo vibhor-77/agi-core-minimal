@@ -20,6 +20,12 @@ Derived primitives (provably equivalent to compositions of atomics):
                 col_count(c, v)        (count of color v in column c)
   Global:       total_count(v)         (count of color v in input)
                 mode_color             (most common color in input)
+  Object:       obj_id(r, c)           (connected component ID, 0=background)
+                obj_size(r, c)         (cell count of component at (r,c))
+                obj_color(r, c)        (color of component at (r,c))
+                obj_top/left/bottom/right(r, c)  (bounding box of component)
+                obj_count              (number of non-background components)
+                max_obj_size           (size of largest component)
 
 Multi-pass: when passes > 1, the tree is applied repeatedly. Each pass reads
 its own output from the previous pass via `get`, while `inp` always reads the
@@ -33,7 +39,7 @@ import numpy as np
 
 # Domain-determined (not tunable — these follow from the problem definition)
 NUM_COLORS = 10                 # ARC uses colors 0–9
-NUM_TERMINALS = 9 + NUM_COLORS  # r, c, max_r, max_c, inp_r, inp_c, pass_num, total_count(v), mode_color + colors
+NUM_TERMINALS = 11 + NUM_COLORS  # r, c, max_r, max_c, inp_r, inp_c, pass_num, mode_color, obj_count, max_obj_size + colors
 MAX_TREE_DEPTH = 7              # limits composition depth; 7 allows ~128 nodes
 MAX_PASSES = 5                  # maximum multi-pass iterations
 
@@ -69,6 +75,9 @@ ARITY = {
     "row_count": 2,                    # count of cells in row r with color v
     "col_count": 2,                    # count of cells in col c with color v
     "total_count": 1,                  # count of all cells with color v in input
+    # Object (connected component) primitives — computed on g_original via BFS
+    "obj_id": 2, "obj_size": 2, "obj_color": 2,       # component identity
+    "obj_top": 2, "obj_left": 2, "obj_bottom": 2, "obj_right": 2,  # bounding box
 }
 
 
@@ -89,7 +98,9 @@ def random_tree(max_depth=4, depth=0, library=None):
         if ch == 5: return ("inp_c",)
         if ch == 6: return ("pass_num",)
         if ch == 7: return ("mode_color",)
-        return ("const", ch - 8)
+        if ch == 8: return ("obj_count",)
+        if ch == 9: return ("max_obj_size",)
+        return ("const", ch - 10)
     ops = list(ARITY)
     op = ops[np.random.randint(len(ops))]
     children = [random_tree(max_depth, depth + 1, library) for _ in range(ARITY[op])]
@@ -188,6 +199,63 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
         global_hist[v] = (g_original == v).sum()
     MODE_COLOR = np.int64(np.argmax(global_hist))
 
+    # ── Connected component labeling (BFS on g_original, same-color 4-connectivity) ──
+    _label_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+    _comp_size = {}   # label -> cell count
+    _comp_color = {}  # label -> color
+    _comp_top = {}; _comp_left = {}; _comp_bottom = {}; _comp_right = {}
+    _next_label = 1
+    for _sr in range(orig_r):
+        for _sc in range(orig_c):
+            if _label_map[_sr, _sc] != 0 or g_original[_sr, _sc] == 0:
+                continue
+            _color = int(g_original[_sr, _sc])
+            _lbl = _next_label; _next_label += 1
+            _queue = [(_sr, _sc)]
+            _label_map[_sr, _sc] = _lbl
+            _sz = 0; _t = _sr; _l = _sc; _b = _sr; _ri = _sc
+            _qi = 0
+            while _qi < len(_queue):
+                _qr, _qc = _queue[_qi]; _qi += 1
+                _sz += 1
+                if _qr < _t: _t = _qr
+                if _qr > _b: _b = _qr
+                if _qc < _l: _l = _qc
+                if _qc > _ri: _ri = _qc
+                for _dr, _dc in ((-1,0),(1,0),(0,-1),(0,1)):
+                    _nr, _nc = _qr+_dr, _qc+_dc
+                    if 0 <= _nr < orig_r and 0 <= _nc < orig_c and _label_map[_nr, _nc] == 0 and g_original[_nr, _nc] == _color:
+                        _label_map[_nr, _nc] = _lbl
+                        _queue.append((_nr, _nc))
+            _comp_size[_lbl] = _sz
+            _comp_color[_lbl] = _color
+            _comp_top[_lbl] = _t; _comp_left[_lbl] = _l
+            _comp_bottom[_lbl] = _b; _comp_right[_lbl] = _ri
+
+    # Build lookup maps
+    _obj_size_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+    _obj_color_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+    _obj_top_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+    _obj_left_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+    _obj_bottom_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+    _obj_right_map = np.zeros((orig_r, orig_c), dtype=np.int64)
+    for _lbl in _comp_size:
+        _mask = _label_map == _lbl
+        _obj_size_map[_mask] = _comp_size[_lbl]
+        _obj_color_map[_mask] = _comp_color[_lbl]
+        _obj_top_map[_mask] = _comp_top[_lbl]
+        _obj_left_map[_mask] = _comp_left[_lbl]
+        _obj_bottom_map[_mask] = _comp_bottom[_lbl]
+        _obj_right_map[_mask] = _comp_right[_lbl]
+
+    OBJ_COUNT = np.int64(len(_comp_size))
+    MAX_OBJ_SIZE = np.int64(max(_comp_size.values())) if _comp_size else np.int64(0)
+    _obj_maps = {
+        "obj_id": _label_map, "obj_size": _obj_size_map, "obj_color": _obj_color_map,
+        "obj_top": _obj_top_map, "obj_left": _obj_left_map,
+        "obj_bottom": _obj_bottom_map, "obj_right": _obj_right_map,
+    }
+
     def _eval(node):
         node_count[0] += 1
         if node_count[0] > MAX_EVAL_NODES:
@@ -203,6 +271,8 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
         if op == "pass_num": return PN
         if op == "const": return np.int64(node[1])
         if op == "mode_color": return MODE_COLOR
+        if op == "obj_count": return OBJ_COUNT
+        if op == "max_obj_size": return MAX_OBJ_SIZE
         if op == "lib":
             sub = (library or {}).get(node[1])
             return _eval(sub) if sub is not None else np.int64(0)
@@ -243,6 +313,10 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
             ci = np.clip(np.broadcast_to(np.asarray(a), (o_r, o_c)), 0, cur_c - 1).astype(int)
             vi = np.clip(np.broadcast_to(np.asarray(b), (o_r, o_c)), 0, NUM_COLORS - 1).astype(int)
             return col_hist[ci.ravel(), vi.ravel()].reshape(o_r, o_c)
+        if op in _obj_maps:
+            ri = np.clip(np.broadcast_to(np.asarray(a), (o_r, o_c)), 0, orig_r - 1).astype(int)
+            ci = np.clip(np.broadcast_to(np.asarray(b), (o_r, o_c)), 0, orig_c - 1).astype(int)
+            return _obj_maps[op][ri, ci]
         return np.int64(0)
 
     try:
@@ -300,9 +374,11 @@ def mutate(tree, library=None):
         op = node[0]
         if op == "const":
             return replace(tree, path, ("const", np.random.randint(NUM_COLORS)))
-        if op in ("r", "c", "max_r", "max_c", "inp_r", "inp_c", "pass_num", "mode_color"):
+        if op in ("r", "c", "max_r", "max_c", "inp_r", "inp_c", "pass_num", "mode_color",
+                  "obj_count", "max_obj_size"):
             terms = [("r",), ("c",), ("max_r",), ("max_c",), ("inp_r",), ("inp_c",),
-                     ("pass_num",), ("mode_color",), ("const", np.random.randint(NUM_COLORS))]
+                     ("pass_num",), ("mode_color",), ("obj_count",), ("max_obj_size",),
+                     ("const", np.random.randint(NUM_COLORS))]
             return replace(tree, path, terms[np.random.randint(len(terms))])
         if op in ARITY and ARITY[op] == 2:
             bin_ops = [k for k, v in ARITY.items() if v == 2]
