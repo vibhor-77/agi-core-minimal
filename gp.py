@@ -13,6 +13,20 @@ for each cell (r, c) of the output grid. All primitives are truly atomic:
 
 import numpy as np
 
+# ── Constants ────────────────────────────────────────────────────────
+NUM_COLORS = 10                 # ARC uses colors 0–9
+NUM_TERMINALS = 4 + NUM_COLORS  # r, c, max_r, max_c + one per color
+P_TERMINAL = 0.4                # probability of generating a terminal at non-leaf depth
+P_LIBRARY_TERMINAL = 0.15       # probability of using a library entry when generating a terminal
+MAX_EVAL_NODES = 300            # abort evaluation if tree expands beyond this many nodes
+MAX_TREE_DEPTH = 7              # maximum depth for crossover and mutation results
+TOURNAMENT_K = 4                # number of candidates in tournament selection
+
+# Mutation type probabilities (must sum to 1.0)
+P_MUTATE_SUBTREE = 0.5          # replace a subtree with a random tree
+P_MUTATE_POINT = 0.3            # change a single node's type or value
+# remaining probability → hoist (replace tree with one of its subtrees)
+
 # ── Tree structure ───────────────────────────────────────────────────
 # A node is a tuple: (op, child1, child2, ...)
 # Terminals have no children: ("r",), ("c",), ("max_r",), ("max_c",),
@@ -23,11 +37,11 @@ ARITY = {"add": 2, "sub": 2, "mod": 2, "eq": 2, "gt": 2, "get": 2, "if": 3}
 
 def random_tree(max_depth=4, depth=0, library=None):
     """Generate a random expression tree."""
-    p_term = 0.4 if depth < max_depth - 1 else 1.0
+    p_term = P_TERMINAL if depth < max_depth - 1 else 1.0
     if depth >= max_depth or np.random.random() < p_term:
-        if library and np.random.random() < 0.15:
+        if library and np.random.random() < P_LIBRARY_TERMINAL:
             return ("lib", list(library)[np.random.randint(len(library))])
-        ch = np.random.randint(14)  # 4 vars + 10 constants
+        ch = np.random.randint(NUM_TERMINALS)
         if ch == 0: return ("r",)
         if ch == 1: return ("c",)
         if ch == 2: return ("max_r",)
@@ -108,7 +122,7 @@ def evaluate(tree, input_grid, out_shape=None, library=None):
 
     def _eval(node):
         node_count[0] += 1
-        if node_count[0] > 300:
+        if node_count[0] > MAX_EVAL_NODES:
             raise RuntimeError("expression too large")
         op = node[0]
         # Terminals
@@ -145,7 +159,7 @@ def evaluate(tree, input_grid, out_shape=None, library=None):
 
 
 # ── GP operators ─────────────────────────────────────────────────────
-def crossover(p1, p2, max_depth=7):
+def crossover(p1, p2, max_depth=MAX_TREE_DEPTH):
     """Swap a random subtree of p1 with a random subtree of p2."""
     s1, s2 = subtrees(p1), subtrees(p2)
     path, _ = s1[np.random.randint(len(s1))]
@@ -154,22 +168,22 @@ def crossover(p1, p2, max_depth=7):
     return child if depth(child) <= max_depth else p1
 
 
-def mutate(tree, max_depth=7, library=None):
+def mutate(tree, max_depth=MAX_TREE_DEPTH, library=None):
     """Apply one random mutation: subtree, point, or hoist."""
     r = np.random.random()
     subs = subtrees(tree)
     path, node = subs[np.random.randint(len(subs))]
 
-    if r < 0.5:  # subtree: replace with random tree
+    if r < P_MUTATE_SUBTREE:
         remaining = max(1, max_depth - len(path))
         return replace(tree, path, random_tree(remaining, library=library))
 
-    if r < 0.8:  # point: change node type or constant
+    if r < P_MUTATE_SUBTREE + P_MUTATE_POINT:
         op = node[0]
         if op == "const":
-            return replace(tree, path, ("const", np.random.randint(10)))
+            return replace(tree, path, ("const", np.random.randint(NUM_COLORS)))
         if op in ("r", "c", "max_r", "max_c"):
-            terms = [("r",), ("c",), ("max_r",), ("max_c",), ("const", np.random.randint(10))]
+            terms = [("r",), ("c",), ("max_r",), ("max_c",), ("const", np.random.randint(NUM_COLORS))]
             return replace(tree, path, terms[np.random.randint(len(terms))])
         if op in ARITY and ARITY[op] == 2:
             bin_ops = [k for k, v in ARITY.items() if v == 2]
@@ -184,7 +198,7 @@ def mutate(tree, max_depth=7, library=None):
     return tree
 
 
-def tournament(population, fitnesses, k=4):
+def tournament(population, fitnesses, k=TOURNAMENT_K):
     """Select the fittest of k random individuals."""
     idxs = np.random.choice(len(population), size=min(k, len(population)), replace=False)
     return population[max(idxs, key=lambda i: fitnesses[i])]

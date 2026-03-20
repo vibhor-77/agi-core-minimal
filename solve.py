@@ -11,6 +11,35 @@ import json, sys, os, numpy as np
 from pathlib import Path
 import gp
 
+# ── Constants ────────────────────────────────────────────────────────
+
+# Fitness
+CHANGED_CELL_WEIGHT = 3.0       # changed cells matter more than unchanged
+PARSIMONY_PENALTY = 0.002       # fitness penalty per tree node (Occam's razor)
+
+# Search budget
+POP_SIZE = 80                   # default population size per task
+POP_SIZE_NEAR_MISS = 120        # larger population for promising tasks
+GENERATIONS = 20                # default generations per task
+GENERATIONS_NEAR_MISS = 30      # more generations for promising tasks
+NEAR_MISS_THRESHOLD = 0.85      # fitness above this gets extra search budget
+STALE_LIMIT = 7                 # stop early after this many generations without improvement
+ELITE_FRACTION = 5              # keep top 1/N of population as elite
+MUTATION_AFTER_CROSSOVER = 0.3  # probability of mutating a crossover child
+REFINE_THRESHOLD = 0.7          # minimum fitness to trigger neighborhood refinement
+
+# Abstraction
+MIN_SUBTREE_SIZE = 3            # minimum nodes for a subtree to be worth abstracting
+MAX_SUBTREE_SIZE = 20           # maximum nodes for abstraction (avoid over-specific)
+MIN_SHARED_SOLVERS = 2          # subtree must appear in this many solvers to be promoted
+
+# Eval
+EVAL_POP_SIZE = 100             # population size for eval search
+EVAL_GENERATIONS = 25           # generations for eval search
+
+# Seeds
+MAX_SHIFT = 4                   # generate shift seeds from 1 to this value
+
 # ── Data ─────────────────────────────────────────────────────────────
 
 def load(path):
@@ -78,13 +107,13 @@ def fitness(tree, examples, library=None):
         n_ch, n_un = int(changed.sum()), int((~changed).sum())
         score = 0.0
         if n_ch > 0:
-            score += 3.0 * np.sum(got[changed] == out_a[changed])
+            score += CHANGED_CELL_WEIGHT * np.sum(got[changed] == out_a[changed])
         if n_un > 0:
             score += np.sum(got[~changed] == out_a[~changed])
-        max_score = 3.0 * n_ch + n_un
+        max_score = CHANGED_CELL_WEIGHT * n_ch + n_un
         total += score / max_score if max_score > 0 else 0.0
     accuracy = total / len(examples)
-    return max(0.0, accuracy - 0.002 * gp.size(tree))
+    return max(0.0, accuracy - PARSIMONY_PENALTY * gp.size(tree))
 
 
 def solves(tree, examples, library=None):
@@ -106,7 +135,7 @@ def simplify(tree, examples, library=None):
         R, C, ("max_r",), ("max_c",), IDENTITY, ("get", C, R),
         ("sub", ("sub", ("max_r",), ("const", 1)), R),
         ("sub", ("sub", ("max_c",), ("const", 1)), C),
-    ] + [("const", i) for i in range(10)]
+    ] + [("const", i) for i in range(gp.NUM_COLORS)]
     changed = True
     while changed:
         changed = False
@@ -145,13 +174,13 @@ def make_seeds():
         ("get", flip_c, R),                                 # rotate ccw
     ]
     # Shifts by 1–4
-    for k in range(1, 5):
+    for k in range(1, MAX_SHIFT + 1):
         K = ("const", k)
         seeds.append(("get", ("mod", ("add", R, K), MR), C))   # shift down
         seeds.append(("get", R, ("mod", ("add", C, K), MC)))   # shift right
     # Recolors: if cell == x, change to y
-    for x in range(10):
-        for y in range(10):
+    for x in range(gp.NUM_COLORS):
+        for y in range(gp.NUM_COLORS):
             if x != y:
                 seeds.append(("if", ("eq", ("get", R, C), ("const", x)),
                               ("const", y), ("get", R, C)))
@@ -160,21 +189,23 @@ def make_seeds():
 
 # ── Search ───────────────────────────────────────────────────────────
 
-def search(examples, seed=None, library=None, pop_size=80, gens=20):
+def search(examples, seed=None, library=None, pop_size=POP_SIZE, gens=GENERATIONS):
     """Evolve a program for a single task.
 
     Starts from seed templates, evolves via tournament selection + crossover/mutation.
     Returns (best_tree, best_fitness).
     """
     seeds = make_seeds()
-    pop_size = max(pop_size, len(seeds) + 20)
+    pop_size = max(pop_size, len(seeds) + 20)  # ensure room for seeds + random
     pop = list(seeds)
 
     if seed is not None and seed != IDENTITY:
         pop.append(seed)
-        for _ in range(pop_size // 6):
+        n_seed_mutants = pop_size // ELITE_FRACTION
+        for _ in range(n_seed_mutants):
             pop.append(gp.mutate(seed, library=library))
-    for _ in range(pop_size // 6):
+    n_identity_mutants = pop_size // ELITE_FRACTION
+    for _ in range(n_identity_mutants):
         pop.append(gp.mutate(IDENTITY, library=library))
     while len(pop) < pop_size:
         pop.append(gp.random_tree(max_depth=4, library=library))
@@ -194,25 +225,26 @@ def search(examples, seed=None, library=None, pop_size=80, gens=20):
         if solves(best_t, examples, library):
             return simplify(best_t, examples, library), 1.0
         stale += 1
-        if stale > 7:
+        if stale > STALE_LIMIT:
             break
         # Next generation
         ranked = sorted(zip(fits, pop), reverse=True)
-        elite = [p for _, p in ranked[:pop_size // 5]]
+        elite = [p for _, p in ranked[:pop_size // ELITE_FRACTION]]
         new_pop = list(elite) + [IDENTITY, best_t]
-        for _ in range(pop_size // 10):
+        n_best_mutants = pop_size // (ELITE_FRACTION * 2)
+        for _ in range(n_best_mutants):
             new_pop.append(gp.mutate(best_t, library=library))
         while len(new_pop) < pop_size:
             p1 = gp.tournament(pop, fits)
             p2 = gp.tournament(pop, fits)
             child = gp.crossover(p1, p2)
-            if np.random.random() < 0.3:
+            if np.random.random() < MUTATION_AFTER_CROSSOVER:
                 child = gp.mutate(child, library=library)
             new_pop.append(child)
         pop = new_pop
 
     # Neighborhood refinement: try all single-node edits
-    if best_f > 0.7 and not solves(best_t, examples, library):
+    if best_f > REFINE_THRESHOLD and not solves(best_t, examples, library):
         best_t, best_f = refine(best_t, examples, library)
     return best_t, best_f
 
@@ -221,7 +253,7 @@ def refine(tree, examples, library=None):
     """Try all single-node edits of tree. Returns (best_tree, best_fitness)."""
     best_t, best_f = tree, fitness(tree, examples, library)
     terminals = [("r",), ("c",), ("max_r",), ("max_c",)]
-    terminals += [("const", i) for i in range(10)]
+    terminals += [("const", i) for i in range(gp.NUM_COLORS)]
     for name in (library or {}):
         terminals.append(("lib", name))
     binary_ops = [k for k, v in gp.ARITY.items() if v == 2]
@@ -262,13 +294,13 @@ def abstract(solvers, library):
         seen = set()
         for _, sub in gp.subtrees(tree):
             sz = gp.size(sub)
-            if sz < 3 or sz > 20 or sub in seen:
+            if sz < MIN_SUBTREE_SIZE or sz > MAX_SUBTREE_SIZE or sub in seen:
                 continue
             seen.add(sub)
             sub_sources.setdefault(sub, set()).add(i)
     existing = set(library.values())
     for sub, sources in sub_sources.items():
-        if len(sources) >= 2 and sub not in existing:
+        if len(sources) >= MIN_SHARED_SOLVERS and sub not in existing:
             name = f"L{len(library)}"
             library[name] = sub
             existing.add(sub)
@@ -295,8 +327,8 @@ def evolve(tasks, rounds, library):
         for tid in tids:
             prev = best_fit[tid][0] if tid in best_fit else None
             prev_f = best_fit[tid][1] if tid in best_fit else 0
-            ps = 120 if prev_f > 0.85 else 80
-            gs = 30 if prev_f > 0.85 else 20
+            ps = POP_SIZE_NEAR_MISS if prev_f > NEAR_MISS_THRESHOLD else POP_SIZE
+            gs = GENERATIONS_NEAR_MISS if prev_f > NEAR_MISS_THRESHOLD else GENERATIONS
             tree, f = search(tasks[tid]["train"], seed=prev, library=library,
                              pop_size=ps, gens=gs)
             if f > best_fit.get(tid, (None, 0))[1]:
@@ -309,7 +341,7 @@ def evolve(tasks, rounds, library):
         if len(solved) >= 2:
             abstract(list(solved.values()), library)
 
-        n_near = sum(1 for t in tids if best_fit.get(t, (None, 0))[1] > 0.8)
+        n_near = sum(1 for t in tids if best_fit.get(t, (None, 0))[1] > NEAR_MISS_THRESHOLD)
         print(f"Round {rnd}: {len(solved)}/{len(tasks)} solved "
               f"(+{new_count}), {n_near} near, lib={len(library)}")
     return solved
@@ -345,7 +377,7 @@ def evaluate(tasks, library, train_solvers=None):
             continue
 
         # Per-task search
-        tree, _ = search(train_ex, library=library, pop_size=100, gens=25)
+        tree, _ = search(train_ex, library=library, pop_size=EVAL_POP_SIZE, gens=EVAL_GENERATIONS)
         if solves(tree, train_ex, library):
             solved_train += 1
             if solves(tree, test_ex, library):
