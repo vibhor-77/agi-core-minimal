@@ -14,18 +14,30 @@ for each cell (r, c) of the output grid. All primitives are truly atomic:
 import numpy as np
 
 # ── Constants ────────────────────────────────────────────────────────
+
+# Domain-determined (not tunable — these follow from the problem definition)
 NUM_COLORS = 10                 # ARC uses colors 0–9
 NUM_TERMINALS = 4 + NUM_COLORS  # r, c, max_r, max_c + one per color
-P_TERMINAL = 0.4                # probability of generating a terminal at non-leaf depth
-P_LIBRARY_TERMINAL = 0.15       # probability of using a library entry when generating a terminal
-MAX_EVAL_NODES = 300            # abort evaluation if tree expands beyond this many nodes
-MAX_TREE_DEPTH = 7              # maximum depth for crossover and mutation results
-TOURNAMENT_K = 4                # number of candidates in tournament selection
+MAX_TREE_DEPTH = 7              # limits composition depth; 7 allows ~128 nodes
 
-# Mutation type probabilities (must sum to 1.0)
-P_MUTATE_SUBTREE = 0.5          # replace a subtree with a random tree
-P_MUTATE_POINT = 0.3            # change a single node's type or value
-# remaining probability → hoist (replace tree with one of its subtrees)
+# Tree generation probabilities
+# P_TERMINAL ≈ 1/(1+mean_arity) keeps expected tree size finite.
+# Mean arity across our ops is ~2.1, so 1/3.1 ≈ 0.32. We use 0.35.
+P_TERMINAL = 0.35
+
+# Safety: max node evaluations = 2^(MAX_TREE_DEPTH+1) with headroom for library expansion
+MAX_EVAL_NODES = 2 ** (MAX_TREE_DEPTH + 1)
+
+# Tournament: k=4 gives ~75% chance of selecting the best quartile.
+# Standard range is 2–7; higher = more selection pressure.
+TOURNAMENT_K = 4
+
+# Mutation operator weights (relative, not probabilities — they get normalized).
+# Subtree mutation is most exploratory, point mutation is most conservative,
+# hoist simplifies. Weights roughly follow the "big-medium-small" mutation spectrum.
+MUTATE_WEIGHTS = {"subtree": 5, "point": 3, "hoist": 2}
+_MUTATE_TOTAL = sum(MUTATE_WEIGHTS.values())
+
 
 # ── Tree structure ───────────────────────────────────────────────────
 # A node is a tuple: (op, child1, child2, ...)
@@ -36,11 +48,20 @@ ARITY = {"add": 2, "sub": 2, "mod": 2, "eq": 2, "gt": 2, "get": 2, "if": 3}
 
 
 def random_tree(max_depth=4, depth=0, library=None):
-    """Generate a random expression tree."""
+    """Generate a random expression tree.
+
+    Terminal probability increases with depth so trees stay bounded.
+    Library entries are used as terminals proportionally to library size
+    (more entries → higher chance one is useful).
+    """
     p_term = P_TERMINAL if depth < max_depth - 1 else 1.0
     if depth >= max_depth or np.random.random() < p_term:
-        if library and np.random.random() < P_LIBRARY_TERMINAL:
-            return ("lib", list(library)[np.random.randint(len(library))])
+        # Use library entry with probability proportional to library fraction
+        # of total vocabulary: lib_size / (lib_size + NUM_TERMINALS)
+        if library:
+            lib_frac = len(library) / (len(library) + NUM_TERMINALS)
+            if np.random.random() < lib_frac:
+                return ("lib", list(library)[np.random.randint(len(library))])
         ch = np.random.randint(NUM_TERMINALS)
         if ch == 0: return ("r",)
         if ch == 1: return ("c",)
@@ -78,6 +99,7 @@ def to_str(tree):
 
 
 # ── Tree manipulation ────────────────────────────────────────────────
+
 def subtrees(tree):
     """All (path, subtree) pairs. Path is a tuple of child indices."""
     result = [((), tree)]
@@ -99,6 +121,7 @@ def replace(tree, path, new):
 
 
 # ── Evaluation ───────────────────────────────────────────────────────
+
 def evaluate(tree, input_grid, out_shape=None, library=None):
     """Evaluate tree for every cell of the output grid.
 
@@ -159,31 +182,36 @@ def evaluate(tree, input_grid, out_shape=None, library=None):
 
 
 # ── GP operators ─────────────────────────────────────────────────────
-def crossover(p1, p2, max_depth=MAX_TREE_DEPTH):
+
+def crossover(p1, p2):
     """Swap a random subtree of p1 with a random subtree of p2."""
     s1, s2 = subtrees(p1), subtrees(p2)
     path, _ = s1[np.random.randint(len(s1))]
     _, donor = s2[np.random.randint(len(s2))]
     child = replace(p1, path, donor)
-    return child if depth(child) <= max_depth else p1
+    return child if depth(child) <= MAX_TREE_DEPTH else p1
 
 
-def mutate(tree, max_depth=MAX_TREE_DEPTH, library=None):
-    """Apply one random mutation: subtree, point, or hoist."""
-    r = np.random.random()
+def mutate(tree, library=None):
+    """Apply one random mutation: subtree, point, or hoist.
+
+    Mutation type chosen by weighted random selection (see MUTATE_WEIGHTS).
+    """
+    r = np.random.random() * _MUTATE_TOTAL
     subs = subtrees(tree)
     path, node = subs[np.random.randint(len(subs))]
 
-    if r < P_MUTATE_SUBTREE:
-        remaining = max(1, max_depth - len(path))
+    if r < MUTATE_WEIGHTS["subtree"]:
+        remaining = max(1, MAX_TREE_DEPTH - len(path))
         return replace(tree, path, random_tree(remaining, library=library))
 
-    if r < P_MUTATE_SUBTREE + P_MUTATE_POINT:
+    if r < MUTATE_WEIGHTS["subtree"] + MUTATE_WEIGHTS["point"]:
         op = node[0]
         if op == "const":
             return replace(tree, path, ("const", np.random.randint(NUM_COLORS)))
         if op in ("r", "c", "max_r", "max_c"):
-            terms = [("r",), ("c",), ("max_r",), ("max_c",), ("const", np.random.randint(NUM_COLORS))]
+            terms = [("r",), ("c",), ("max_r",), ("max_c",),
+                     ("const", np.random.randint(NUM_COLORS))]
             return replace(tree, path, terms[np.random.randint(len(terms))])
         if op in ARITY and ARITY[op] == 2:
             bin_ops = [k for k, v in ARITY.items() if v == 2]

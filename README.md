@@ -1,97 +1,121 @@
-# agi-core-minimal: The 4-Pillar Learning Loop
+# agi-core-minimal
 
-**One algorithm. Four pillars. Compounding intelligence.**
+**Evolutionary program synthesis from atomic primitives.**
 
-```
-explore → feedback → keep best (even near-misses) → abstract → repeat
-    │         │              │                           │
-    │         │              │                           └─ promote sub-programs as new primitives
-    │         │              └─ approximability: imperfect attempts are valuable
-    │         └─ closed-loop error signal drives every decision
-    └─ search the space of programs by composing primitives
-```
+A genetic programming system that discovers grid transformations (flips, rotations, recoloring, conditional logic) by composing 11 truly primitive operations. No hand-crafted transforms — the system evolves them.
 
 Based on the research and principles proposed by [Vibhor Jain](https://github.com/vibhor-77).
 
-## The 4 Pillars
+## How it works
 
-| # | Pillar | What it does | In the code |
-|---|--------|-------------|-------------|
-| 1 | **Feedback Loops** | Cell-level error signal that drives the entire cycle — which programs to keep, which sub-programs to promote, when to stop | `error(program, examples) → float` |
-| 2 | **Approximability** | Near-miss programs are valuable — closer is better, even if imperfect. The loop keeps the *best* program per task, not just perfect solves | quality = 1 - error, fed into abstraction |
-| 3 | **Abstraction & Composition** | Two sides of one coin: *compose* programs from primitives, *abstract* recurring sub-programs back into new primitives | `execute(program, grid)` + `abstract(scored_programs)` |
-| 4 | **Exploration** | Weighted sampling of program compositions — proven primitives get sampled more, new ones maintain exploration | `candidates(max_depth, budget) → generator` |
+The system evolves **expression trees** that compute `f(grid, r, c) → color` for each cell of the output grid. Starting from atomic operations (read a cell, add two numbers, compare values), evolution discovers compositions like:
 
-**Why these 4 and not more?** Composition and abstraction are inseparable — composition builds programs *down* from primitives, abstraction lifts sub-programs *up* into new primitives. They're the same mechanism in two directions. Approximability is what makes the cycle compound: without it, only perfect solves feed abstraction and most tasks contribute nothing.
+```
+get(c, r)                                          → transpose
+get(sub(sub(max_r, 1), r), c)                      → flip vertical
+if(eq(get(r,c), 5), 8, if(eq(get(r,c), 8), 5, get(r,c)))  → swap colors 5↔8
+if(eq(get(r,c), 4), get(r, sub(sub(max_c,1), c)), get(r,c)) → conditional mirror
+```
 
-## How Compounding Works
+These are not built-in — evolution finds them from scratch.
 
-The loop runs multiple rounds. Each round:
+### The primitives
 
-1. **Explore** (Pillar 4) — sample compositions weighted by primitive usefulness
-2. **Score** (Pillar 1) — cell-level feedback tells us how close each program got
-3. **Keep best** (Pillar 2) — even a 60%-correct program is valuable
-4. **Abstract** (Pillar 3) — sub-programs recurring across good attempts become new primitives
-5. **Repeat** — the library grows, so depth-2 search over promoted depth-2 compositions reaches depth-4
+Every program is built from these 11 operations:
 
-The key: a near-miss in round 1 gets its sub-programs promoted. In round 2, those promoted primitives let exploration reach programs it couldn't before. That's compounding — even failures contribute.
+| Category | Operations | Purpose |
+|----------|-----------|---------|
+| **Position** | `r`, `c`, `max_r`, `max_c` | Where am I? How big is the grid? |
+| **Perception** | `get(row, col)` | Read the input grid at a computed position |
+| **Constants** | `0`–`9` | The 10 ARC color values |
+| **Arithmetic** | `add`, `sub`, `mod` | Compute positions (mirror, shift, wrap) |
+| **Logic** | `eq`, `gt`, `if` | Compare values and branch |
 
-## Quick Start
+This set is **universal**: any computable grid transformation can be expressed as a composition of these operations (given sufficient depth).
+
+### The evolution loop
+
+For each task, the system runs a mini-evolution:
+
+1. **Seed** the population with known-useful templates (geometric transforms, recolors) and random trees
+2. **Evaluate** each program's fitness on the task's training examples
+3. **Select** the fittest via tournament selection
+4. **Breed** new programs via crossover (swap subtrees between parents) and mutation
+5. **Repeat** for multiple generations until solved or stale
+6. **Simplify** solutions by greedily removing unnecessary subtrees
+
+### Compounding via abstraction
+
+After each round of per-task evolution, subtrees that appear in 2+ solver programs are promoted to the **library** as new single-node primitives. A 10-node subtree that took many generations to discover becomes a `("lib", "L0")` terminal — usable in any future random tree at zero depth cost.
+
+This is the compounding mechanism: round 1 discovers `get(c, r)` (transpose). It gets abstracted as `L0`. In round 5, a program uses `L0` as a building block to solve a different task that requires transpose + something else.
+
+## Architecture
+
+Two files, clear separation:
+
+**`gp.py`** — The GP engine (~200 lines). Tree representation, vectorized numpy evaluation, crossover/mutation operators. Knows nothing about ARC.
+
+**`solve.py`** — The application (~280 lines). Data loading, fitness scoring, seed generation, per-task search, abstraction, evolution loop. Knows nothing about tree internals.
+
+## Quick start
 
 ```bash
-# Clone ARC-AGI dataset
+# Get the ARC dataset
 git clone https://github.com/fchollet/ARC-AGI data/ARC-AGI
 
 pip install numpy
 
-# Run the learning loop (3 rounds by default)
+# Run (default: 20 rounds on all 400 training tasks + 400 eval tasks)
 python solve.py
 
-# Or specify data path and rounds
-python solve.py data/ARC-AGI/data/training 50
+# Or specify paths and rounds
+python solve.py data/ARC-AGI/data/training data/ARC-AGI/data/evaluation 10
 ```
 
 ### What you'll see
 
 ```
-Loaded 400 tasks, 5 primitives
-Round 1: 7/400 solved, 251 near-misses, 10 primitives (+5 new)
-Round 2: 7/400 solved, 251 near-misses, 10 primitives (+5 new)
-Round 3: 7/400 solved, 251 near-misses, 10 primitives (+0 new)
+Loaded 400 training tasks
+  ✓ 74dd1130: get(c, r)                              ← discovered transpose
+  ✓ 67a3c6ac: get(r, sub(sub(max_c, 1), c))          ← discovered flip_h
+  ✓ d511f180: if(eq(get(r,c),8), 5, if(eq(get(r,c),5), 8, get(r,c)))  ← color swap
+  ++ lib 'L0' = get(c, r) (size=3, shared by 2)      ← abstracted for reuse
+Round 1: 19/400 solved (+19), 155 near, lib=5
 ```
 
-The scaffolding starts with 5 primitives (rotate, flip, transpose). Accuracy comes from adding more primitives — the loop and architecture are what matter.
+## Design principles
 
-## `solve.py` (~100 lines)
+### Continuous, not threshold-based
 
-```
-docstring                — the 4 pillars, one sentence each
-Domain                   — primitives dict + load()
-Pillar 3a: Composition   — execute(program, grid)
-Pillar 1:  Feedback      — error(program, examples)     ← cell-level
-Pillar 4:  Exploration   — candidates(max_depth, budget) ← weighted sampling
-Pillar 3b: Abstraction   — abstract(scored_programs)  ← quality-weighted
-The Loop                 — learn(tasks, rounds)        ← Pillar 2 lives here
-Main                     — load tasks, call learn()
-```
+The system avoids hard cutoffs wherever possible:
 
-**Adding a new primitive** is one line in the `primitives` dict:
+- **Search budget** scales linearly with previous fitness. A task at fitness 0.6 gets 60% more compute than one at 0.0. No cliff between "near-miss" and "not."
+- **Patience** (when to stop) scales with fitness. High fitness = closer to solving = worth trying longer. At fitness 0, patience is 3 generations. At 0.9, it's 8.
+- **Neighborhood refinement** triggers probabilistically: probability = fitness. A task at 0.3 fitness has 30% chance of refinement; at 0.9, 90%.
+- **Library terminal probability** scales with library size: `lib_size / (lib_size + num_terminals)`. An empty library contributes nothing; a large one gets proportionally more sampling.
 
-```python
-"crop_top": lambda g: g[1:],
-```
+### Every constant has a reason
 
-**Adding a new domain** means replacing `primitives` and `load()` — everything else stays the same.
+| Constant | Value | Why |
+|----------|-------|-----|
+| `P_TERMINAL` | 0.35 | ≈ 1/(1 + mean_arity). Mean arity across our ops is ~2.1. This keeps expected tree size finite. |
+| `MAX_TREE_DEPTH` | 7 | Allows trees up to ~128 nodes. Deep enough for complex compositions, shallow enough for tractable search. |
+| `TOURNAMENT_K` | 4 | Gives ~75% chance of selecting from the top quartile. Standard GP range is 2–7. |
+| `CHANGED_CELL_WEIGHT` | 3.0 | In typical ARC tasks, ~10-20% of cells change. Weight of 3 means a program must fix ~75% of changed cells to beat identity — creating a gradient above the identity plateau. |
+| `PARSIMONY_PENALTY` | 0.002 | A 50-node tree loses ~0.1 fitness. Enough to prefer simpler programs among equals, not enough to prevent finding complex solutions. |
+| `MUTATE_WEIGHTS` | 5:3:2 | Subtree mutation is most exploratory, point mutation is conservative, hoist simplifies. Weights follow the big-medium-small mutation spectrum from GP literature. |
 
-## Full System
+### Minimal and universal
 
-The minimal `solve.py` demonstrates the architecture. The full system lives at [agi-core](https://github.com/vibhor-77/agi-core) and adds:
+The primitive set is deliberately small (11 operations) but **universal** — any computable grid transformation can be expressed. The goal is not to add domain-specific primitives but to build a mechanism that discovers useful compositions from atomic operations.
 
-- 75 atomic primitives (transforms + perception + parameterized)
-- 10 wake phases (exhaustive enumeration + 9 ARC-specific strategies)
-- Bounded library with eviction and ROI tracking
-- Multi-domain support (ARC-AGI-1/2, Zork, list ops, symbolic math)
-- Interleaved train → eval pipeline with culture transfer
+## Current results
+
+- **22/400** training tasks solved in 3 rounds
+- Programs are genuinely discovered, not hand-coded
+- Library abstraction enables cross-task transfer
+- Near-miss count grows steadily across rounds (fitness improving on unsolved tasks)
 
 ## License
 

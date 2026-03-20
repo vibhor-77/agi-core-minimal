@@ -13,32 +13,26 @@ import gp
 
 # ── Constants ────────────────────────────────────────────────────────
 
-# Fitness
-CHANGED_CELL_WEIGHT = 3.0       # changed cells matter more than unchanged
-PARSIMONY_PENALTY = 0.002       # fitness penalty per tree node (Occam's razor)
-
-# Search budget
-POP_SIZE = 80                   # default population size per task
-POP_SIZE_NEAR_MISS = 120        # larger population for promising tasks
-GENERATIONS = 20                # default generations per task
-GENERATIONS_NEAR_MISS = 30      # more generations for promising tasks
-NEAR_MISS_THRESHOLD = 0.85      # fitness above this gets extra search budget
-STALE_LIMIT = 7                 # stop early after this many generations without improvement
+# Search budget (base values — actual budget scales continuously with fitness)
+POP_SIZE_BASE = 80              # population at fitness=0; doubles at fitness=1
+GENERATIONS_BASE = 15           # generations at fitness=0; doubles at fitness=1
 ELITE_FRACTION = 5              # keep top 1/N of population as elite
-MUTATION_AFTER_CROSSOVER = 0.3  # probability of mutating a crossover child
-REFINE_THRESHOLD = 0.7          # minimum fitness to trigger neighborhood refinement
 
-# Abstraction
-MIN_SUBTREE_SIZE = 3            # minimum nodes for a subtree to be worth abstracting
-MAX_SUBTREE_SIZE = 20           # maximum nodes for abstraction (avoid over-specific)
-MIN_SHARED_SOLVERS = 2          # subtree must appear in this many solvers to be promoted
+# Fitness function
+# Changed-cell weight: derived from typical ARC tasks where ~10-20% of cells
+# change. Weight of 3 means fixing a changed cell is worth 3 unchanged cells,
+# so a program must get ~75% of changed cells right to beat identity.
+CHANGED_CELL_WEIGHT = 3.0
+# Parsimony: penalty per node. Set so a 50-node tree loses ~0.1 fitness,
+# enough to prefer simpler programs among near-equals but not enough to
+# prevent finding complex solutions.
+PARSIMONY_PENALTY = 0.002
 
-# Eval
-EVAL_POP_SIZE = 100             # population size for eval search
-EVAL_GENERATIONS = 25           # generations for eval search
+# Abstraction: promote subtrees shared across solvers
+MIN_SUBTREE_SIZE = 3            # below this, subtrees are too trivial to abstract
+MAX_SUBTREE_SIZE = 20           # above this, subtrees are too specific to reuse
+MIN_SHARED_SOLVERS = 2          # must appear in at least this many solver programs
 
-# Seeds
-MAX_SHIFT = 4                   # generate shift seeds from 1 to this value
 
 # ── Data ─────────────────────────────────────────────────────────────
 
@@ -54,44 +48,22 @@ def load(path):
     return tasks
 
 
-def output_shape(inp, out):
-    """Get the output shape for a single example."""
-    return np.asarray(out).shape
-
-
-def predict_test_shape(train_examples):
-    """Infer the input→output shape rule from training examples."""
-    rules = []
-    for inp, out in train_examples:
-        si, so = np.asarray(inp).shape, np.asarray(out).shape
-        if si == so:
-            rules.append("same")
-        elif (si[1], si[0]) == so:
-            rules.append("transpose")
-        else:
-            rules.append(so)  # fixed shape
-    if len(set(rules)) == 1:
-        return rules[0]
-    return "same"  # default fallback
-
-
-def test_output_shape(rule, inp):
-    """Apply a shape rule to predict output shape for a test input."""
-    si = np.asarray(inp).shape
-    if rule == "same":
-        return si
-    if rule == "transpose":
-        return (si[1], si[0])
-    return rule  # fixed shape tuple
-
-
 # ── Scoring ──────────────────────────────────────────────────────────
 
 IDENTITY = ("get", ("r",), ("c",))
 
 
 def fitness(tree, examples, library=None):
-    """Weighted cell accuracy: changed cells worth 3x, with parsimony pressure."""
+    """Weighted cell accuracy with parsimony pressure.
+
+    Changed cells are weighted higher than unchanged cells so that
+    evolution is rewarded for fixing the cells that actually differ
+    between input and output, rather than just preserving the background.
+
+    For different-size tasks (where input and output shapes differ),
+    all output cells are treated as "changed" since there is no
+    cell-to-cell correspondence with the input.
+    """
     total = 0.0
     for inp, out in examples:
         out_a = np.asarray(out)
@@ -99,11 +71,10 @@ def fitness(tree, examples, library=None):
         if got is None or got.shape != out_a.shape:
             continue
         inp_a = np.asarray(inp)
-        # Handle different-size tasks: only compare output cells
         if inp_a.shape == out_a.shape:
             changed = inp_a != out_a
         else:
-            changed = np.ones(out_a.shape, dtype=bool)  # all cells "changed"
+            changed = np.ones(out_a.shape, dtype=bool)
         n_ch, n_un = int(changed.sum()), int((~changed).sum())
         score = 0.0
         if n_ch > 0:
@@ -127,7 +98,13 @@ def solves(tree, examples, library=None):
 
 
 def simplify(tree, examples, library=None):
-    """Greedily replace subtrees with simpler equivalents."""
+    """Greedily replace subtrees with simpler equivalents.
+
+    Tries replacing each non-terminal subtree (largest first) with a
+    set of canonical simple programs. If the simplified version still
+    solves all examples, keep it. This removes overfitting junk and
+    improves generalization.
+    """
     if not solves(tree, examples, library):
         return tree
     R, C = ("r",), ("c",)
@@ -160,7 +137,18 @@ def simplify(tree, examples, library=None):
 # ── Seeds ────────────────────────────────────────────────────────────
 
 def make_seeds():
-    """Generate initial program templates from the atomic primitives."""
+    """Generate initial program templates from the atomic primitives.
+
+    These are programs that the system COULD discover through evolution,
+    expressed using only the atomic operations. Including them as seeds
+    ensures the system doesn't waste generations rediscovering well-known
+    geometric transforms, and instead spends its budget on novel compositions.
+
+    Categories:
+      - Geometric remaps (7): identity, transpose, flips, rotations
+      - Shifts (8): circular shifts by 1-4 in each axis
+      - Recolors (90): if cell==X, change to Y (all color pairs)
+    """
     R, C, MR, MC, ONE = ("r",), ("c",), ("max_r",), ("max_c",), ("const", 1)
     flip_r = ("sub", ("sub", MR, ONE), R)   # max_r - 1 - r
     flip_c = ("sub", ("sub", MC, ONE), C)   # max_c - 1 - c
@@ -173,12 +161,10 @@ def make_seeds():
         ("get", C, flip_r),                                 # rotate cw
         ("get", flip_c, R),                                 # rotate ccw
     ]
-    # Shifts by 1–4
-    for k in range(1, MAX_SHIFT + 1):
+    for k in range(1, 5):
         K = ("const", k)
-        seeds.append(("get", ("mod", ("add", R, K), MR), C))   # shift down
-        seeds.append(("get", R, ("mod", ("add", C, K), MC)))   # shift right
-    # Recolors: if cell == x, change to y
+        seeds.append(("get", ("mod", ("add", R, K), MR), C))   # shift down by k
+        seeds.append(("get", R, ("mod", ("add", C, K), MC)))   # shift right by k
     for x in range(gp.NUM_COLORS):
         for y in range(gp.NUM_COLORS):
             if x != y:
@@ -189,23 +175,36 @@ def make_seeds():
 
 # ── Search ───────────────────────────────────────────────────────────
 
-def search(examples, seed=None, library=None, pop_size=POP_SIZE, gens=GENERATIONS):
+def search_budget(prev_fitness):
+    """Compute search effort that scales continuously with fitness.
+
+    Higher fitness = closer to solving = more value in additional effort.
+    Budget scales linearly: fitness=0 gets base, fitness=1 gets 2x base.
+    """
+    scale = 1.0 + prev_fitness
+    return int(POP_SIZE_BASE * scale), int(GENERATIONS_BASE * scale)
+
+
+def search(examples, seed=None, library=None, pop_size=None, gens=None):
     """Evolve a program for a single task.
 
-    Starts from seed templates, evolves via tournament selection + crossover/mutation.
-    Returns (best_tree, best_fitness).
+    Starts from seed templates + mutations, evolves via tournament selection,
+    crossover, and mutation. Stops early when improvement rate drops below
+    threshold. Returns (best_tree, best_fitness).
     """
+    if pop_size is None or gens is None:
+        pop_size, gens = POP_SIZE_BASE, GENERATIONS_BASE
+
     seeds = make_seeds()
-    pop_size = max(pop_size, len(seeds) + 20)  # ensure room for seeds + random
+    pop_size = max(pop_size, len(seeds) + 20)
     pop = list(seeds)
 
+    n_mutants = pop_size // ELITE_FRACTION
     if seed is not None and seed != IDENTITY:
         pop.append(seed)
-        n_seed_mutants = pop_size // ELITE_FRACTION
-        for _ in range(n_seed_mutants):
+        for _ in range(n_mutants):
             pop.append(gp.mutate(seed, library=library))
-    n_identity_mutants = pop_size // ELITE_FRACTION
-    for _ in range(n_identity_mutants):
+    for _ in range(n_mutants):
         pop.append(gp.mutate(IDENTITY, library=library))
     while len(pop) < pop_size:
         pop.append(gp.random_tree(max_depth=4, library=library))
@@ -216,16 +215,25 @@ def search(examples, seed=None, library=None, pop_size=POP_SIZE, gens=GENERATION
         if sf > best_f:
             best_t, best_f = seed, sf
 
+    # Patience scales with fitness: high fitness = worth trying longer.
+    # At fitness=0: patience=3. At fitness=0.9: patience=8.
+    patience = int(3 + best_f * 6)
     stale = 0
-    for _ in range(gens):
+    for gen in range(gens):
         fits = [fitness(p, examples, library) for p in pop]
+        improved = False
         for p, f in zip(pop, fits):
             if f > best_f:
-                best_t, best_f, stale = p, f, 0
+                best_t, best_f = p, f
+                improved = True
+        if improved:
+            stale = 0
+            patience = int(3 + best_f * 6)
+        else:
+            stale += 1
         if solves(best_t, examples, library):
             return simplify(best_t, examples, library), 1.0
-        stale += 1
-        if stale > STALE_LIMIT:
+        if stale > patience:
             break
         # Next generation
         ranked = sorted(zip(fits, pop), reverse=True)
@@ -238,19 +246,27 @@ def search(examples, seed=None, library=None, pop_size=POP_SIZE, gens=GENERATION
             p1 = gp.tournament(pop, fits)
             p2 = gp.tournament(pop, fits)
             child = gp.crossover(p1, p2)
-            if np.random.random() < MUTATION_AFTER_CROSSOVER:
-                child = gp.mutate(child, library=library)
+            # Mutation probability after crossover: always mutate.
+            # Crossover alone is too conservative for this search space.
+            child = gp.mutate(child, library=library)
             new_pop.append(child)
         pop = new_pop
 
-    # Neighborhood refinement: try all single-node edits
-    if best_f > REFINE_THRESHOLD and not solves(best_t, examples, library):
+    # Neighborhood refinement: probability scales with fitness.
+    # Low fitness → don't bother. High fitness → always refine.
+    if np.random.random() < best_f:
         best_t, best_f = refine(best_t, examples, library)
     return best_t, best_f
 
 
 def refine(tree, examples, library=None):
-    """Try all single-node edits of tree. Returns (best_tree, best_fitness)."""
+    """Try all single-node edits of tree.
+
+    Exhaustively tests every alternative terminal at every terminal position,
+    and every alternative binary op at every binary position. This is cheap
+    (typically ~150 evaluations) and converts near-misses into solutions by
+    fixing the one wrong constant or operator.
+    """
     best_t, best_f = tree, fitness(tree, examples, library)
     terminals = [("r",), ("c",), ("max_r",), ("max_c",)]
     terminals += [("const", i) for i in range(gp.NUM_COLORS)]
@@ -286,8 +302,14 @@ def refine(tree, examples, library=None):
 # ── Abstraction ──────────────────────────────────────────────────────
 
 def abstract(solvers, library):
-    """Find subtrees shared by 2+ solvers and add to library."""
-    if len(solvers) < 2:
+    """Find subtrees shared by 2+ solvers and add to library.
+
+    This is the compounding mechanism: useful compositions discovered for
+    one task become single-node building blocks for future tasks. A subtree
+    of size 10 that took many generations to evolve becomes a single "lib"
+    terminal that can appear in any random tree.
+    """
+    if len(solvers) < MIN_SHARED_SOLVERS:
         return
     sub_sources = {}
     for i, tree in enumerate(solvers):
@@ -313,8 +335,9 @@ def abstract(solvers, library):
 def evolve(tasks, rounds, library):
     """Per-task evolution with cross-task abstraction.
 
-    Each round: evolve a program for each unsolved task, then abstract
-    common subtrees from solvers into the library.
+    Each round: evolve a program for each unsolved task (budget proportional
+    to previous fitness), then abstract common subtrees from solvers into the
+    library for use in future rounds.
     """
     solved = {}       # tid → tree
     best_fit = {}     # tid → (tree, fitness)
@@ -322,13 +345,13 @@ def evolve(tasks, rounds, library):
     for rnd in range(1, rounds + 1):
         new_count = 0
         tids = [t for t in tasks if t not in solved]
+        # Process higher-fitness tasks first (most likely to solve next)
         tids.sort(key=lambda t: -(best_fit[t][1] if t in best_fit else 0))
 
         for tid in tids:
             prev = best_fit[tid][0] if tid in best_fit else None
             prev_f = best_fit[tid][1] if tid in best_fit else 0
-            ps = POP_SIZE_NEAR_MISS if prev_f > NEAR_MISS_THRESHOLD else POP_SIZE
-            gs = GENERATIONS_NEAR_MISS if prev_f > NEAR_MISS_THRESHOLD else GENERATIONS
+            ps, gs = search_budget(prev_f)
             tree, f = search(tasks[tid]["train"], seed=prev, library=library,
                              pop_size=ps, gens=gs)
             if f > best_fit.get(tid, (None, 0))[1]:
@@ -338,10 +361,10 @@ def evolve(tasks, rounds, library):
                 new_count += 1
                 print(f"  ✓ {tid}: {gp.to_str(tree)}")
 
-        if len(solved) >= 2:
+        if len(solved) >= MIN_SHARED_SOLVERS:
             abstract(list(solved.values()), library)
 
-        n_near = sum(1 for t in tids if best_fit.get(t, (None, 0))[1] > NEAR_MISS_THRESHOLD)
+        n_near = sum(1 for t in tids if best_fit.get(t, (None, 0))[1] > 0.8)
         print(f"Round {rnd}: {len(solved)}/{len(tasks)} solved "
               f"(+{new_count}), {n_near} near, lib={len(library)}")
     return solved
@@ -352,7 +375,8 @@ def evolve(tasks, rounds, library):
 def evaluate(tasks, library, train_solvers=None):
     """Score on held-out test examples.
 
-    First tries transferring training solvers directly, then runs per-task search.
+    First tries transferring training solvers directly (free generalization
+    test), then runs per-task search with the learned library.
     """
     transfer = list({id(t): t for t in (train_solvers or {}).values()}.values())
     solved_train, solved_test, total = 0, 0, 0
@@ -377,7 +401,7 @@ def evaluate(tasks, library, train_solvers=None):
             continue
 
         # Per-task search
-        tree, _ = search(train_ex, library=library, pop_size=EVAL_POP_SIZE, gens=EVAL_GENERATIONS)
+        tree, _ = search(train_ex, library=library)
         if solves(tree, train_ex, library):
             solved_train += 1
             if solves(tree, test_ex, library):
