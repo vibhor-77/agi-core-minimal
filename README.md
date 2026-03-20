@@ -2,7 +2,7 @@
 
 **Evolutionary program synthesis from atomic primitives.**
 
-A genetic programming system that discovers grid transformations (flips, rotations, recoloring, conditional logic) by composing 11 truly primitive operations. No hand-crafted transforms — the system evolves them.
+A genetic programming system that discovers grid transformations (flips, rotations, recoloring, conditional logic, edge detection, flood fill) by composing atomic primitives + derived perception layers. No hand-crafted transforms — the system evolves them.
 
 Based on the research and principles proposed by [Vibhor Jain](https://github.com/vibhor-77).
 
@@ -21,17 +21,19 @@ These are not built-in — evolution finds them from scratch.
 
 ### The primitives
 
-Every program is built from these 11 operations:
+Every program is built from atomic operations plus derived perception layers:
 
 | Category | Operations | Purpose |
 |----------|-----------|---------|
-| **Position** | `r`, `c`, `max_r`, `max_c` | Where am I? How big is the grid? |
-| **Perception** | `get(row, col)` | Read the input grid at a computed position |
+| **Position** | `r`, `c`, `max_r`, `max_c`, `inp_r`, `inp_c` | Output/input coordinates and dimensions |
+| **Perception** | `get(row, col)`, `inp(row, col)` | Read current/original grid |
 | **Constants** | `0`–`9` | The 10 ARC color values |
 | **Arithmetic** | `add`, `sub`, `mod` | Compute positions (mirror, shift, wrap) |
 | **Logic** | `eq`, `gt`, `if` | Compare values and branch |
+| **Neighborhood** | `n_count(r, c, v)` | Count of 4-neighbors with color v |
+| **Aggregation** | `row_count(r, v)`, `col_count(c, v)`, `total_count(v)`, `mode_color` | Row/col/global color counts |
 
-This set is **universal**: any computable grid transformation can be expressed as a composition of these operations (given sufficient depth).
+The derived primitives (neighborhood, aggregation) are **provably equivalent** to compositions of atomic ops — they're pre-computed for search tractability, analogous to how edge-detection neurons in visual cortex are compiled pixel-level operations.
 
 ### The evolution loop
 
@@ -112,9 +114,9 @@ The primitive set is deliberately small (11 operations) but **universal** — an
 
 ## Current results
 
-- **20-22/400** training tasks solved (seed sweep + 3-5 evolutionary rounds)
-- 12 library entries abstracted, reused in later solutions
-- 112 near-misses (fitness > 0.8) — the system is making partial progress on many tasks
+- **27-30/400** training tasks solved (seed sweep + refinement + 2-3 evolutionary rounds)
+- 17 library entries abstracted, reused in later solutions
+- 128 near-misses (fitness > 0.8) — the system is making partial progress on many tasks
 - Multi-pass programs discovered (2-pass gravity, 3-pass iterative refinement)
 
 ### What works
@@ -122,17 +124,26 @@ The primitive set is deliberately small (11 operations) but **universal** — an
 | Category | Examples | Count |
 |----------|---------|-------|
 | Geometric transforms | transpose, flip_h, flip_v, rotate | 6 |
-| Shifts | shift down by k, column tiling | 3 |
+| Shifts / tiling | shift by k, column tiling, `inp(r, mod(c, inp_c))` | 4 |
 | Color recoloring | if(cell==7, 5, cell), swap 5↔8 | 5 |
 | Conditional geometry | if(cell==0, flip_v, identity) | 3 |
-| Multi-pass | gravity (propagate down), iterative fill | 2 |
+| Neighbor-based | edge detection via n_count, interior detection | 3 |
+| Background / aggregation | mode_color detection, row_count patterns | 3 |
+| Multi-pass | gravity (propagate down), iterative fill | 3 |
 | Compositions | conditional mirror, library-based combos | 3 |
 
 ### What doesn't work (yet)
 
-The remaining ~380 tasks require **object-level reasoning** — identifying connected components, detecting patterns, counting objects, understanding spatial relationships. The cell-level primitives are universal in theory but the search space for object-level behaviors is too large for the current evolutionary budget.
+The remaining ~370 tasks require **object-level reasoning** — identifying connected components, detecting patterns, counting objects, understanding spatial relationships. The derived primitives bridge part of the gap (neighborhood counting enables edge detection, row/column aggregation enables pattern detection) but most tasks need true object-level representation.
 
-The principled path forward: multi-pass evaluation (already implemented) enables cellular-automata-like computation where local rules produce global behavior through iteration. The challenge is evolving the right local rules.
+### Search pipeline
+
+1. **Seed sweep**: test ~300 generic templates + task-specific hypotheses on all tasks
+2. **Task-specific hypothesis generation**: analyze each task's colors, dimensions, and spatial patterns to generate targeted program candidates
+3. **Refinement**: iteratively try single-node edits on near-miss programs
+4. **Wrap refinement**: try wrapping near-miss programs in spatial conditions (n_count, row_count)
+5. **Evolutionary search**: GP evolution on top near-misses with library transfer from solved tasks
+6. **Abstraction**: extract shared subtrees across solvers into reusable library entries
 
 ## License
 
