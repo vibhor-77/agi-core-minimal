@@ -1,99 +1,101 @@
-#!/usr/bin/env python3
-"""4-pillar wake-sleep loop for ARC-AGI-1 in under 100 lines.
-Pillars: (1) Primitives, (2) Composition, (3) Search/Wake, (4) Abstraction/Sleep.
-Usage: python solve.py [data_path] [max_tasks]
 """
-import json, os, sys
-from itertools import product
+Minimal AGI scaffolding built on 5 pillars:
 
-# ── Pillar 1: Primitives (atomic grid → grid transforms) ─────────────────────
-def _crop(g):
-    rs = [i for i, r in enumerate(g) if any(r)]
-    cs = [j for j in range(len(g[0])) if any(g[i][j] for i in rs)] if rs else []
-    return [[g[i][j] for j in cs] for i in rs] if rs and cs else g
+  Composition      — programs are sequences of primitives; execute by chaining
+  Feedback         — continuous error signal: how close is a program to solving a task?
+  Exploration      — search the space of programs by composing primitives
+  Approximability  — near-miss programs are valuable; closer is better even if imperfect
+  Abstraction      — extract recurring sub-programs as new primitives, weighted by quality
 
-PRIMS = {
-    "rot90":   lambda g: [list(r) for r in zip(*g[::-1])],
-    "rot180":  lambda g: [r[::-1] for r in g[::-1]],
-    "flip_h":  lambda g: [r[::-1] for r in g],
-    "flip_v":  lambda g: g[::-1],
-    "transp":  lambda g: [list(r) for r in zip(*g)],
-    "crop":    _crop,
-    "tile_h":  lambda g: [r + r for r in g],
-    "tile_v":  lambda g: g + g,
-    "mir_h":   lambda g: [r + r[::-1] for r in g],
-    "mir_v":   lambda g: g + g[::-1],
-    "up2":     lambda g: [sum(([c,c] for c in r),[]) for r in g for _ in (0,1)],
-    "shrink2": lambda g: [[g[r][c] for c in range(0,len(g[0]),2)]
-                           for r in range(0,len(g),2)] if len(g)>1 else g,
+The learning loop ties them together: explore → feedback → abstract → repeat.
+Even unsuccessful attempts compound — a near-miss promoted as a primitive
+becomes a stepping stone for the next round.
+"""
+import json, sys, os, itertools, numpy as np
+from pathlib import Path
+
+# ── Domain: ARC-AGI-1 ────────────────────────────────────────────────
+primitives = {
+    "rotate_cw":  lambda g: np.rot90(g, k=-1).tolist(),
+    "rotate_ccw": lambda g: np.rot90(g, k=1).tolist(),
+    "flip_h":     lambda g: np.fliplr(g).tolist(),
+    "flip_v":     lambda g: np.flipud(g).tolist(),
+    "transpose":  lambda g: np.transpose(g).tolist(),
 }
 
-# ── Pillar 2: Composition (programs = chains of primitive names) ─────────────
-def run(chain, g):
-    for p in chain: g = PRIMS[p](g)
-    return g
-
-def check(chain, pairs):
-    try:    return all(run(chain, i) == o for i, o in pairs)
-    except: return False
-
-# ── Pillar 3: Search / Wake (enumerate compositions, find solutions) ─────────
-def wake(tasks, max_depth, solved):
-    found, names = {}, list(PRIMS)
-    for tid, (train, test) in tasks.items():
-        if tid in solved: continue
-        for d in range(1, max_depth + 1):
-            hit = next((list(p) for p in product(names, repeat=d)
-                        if check(list(p), train + test)), None)
-            if hit: found[tid] = hit; break
-    return found
-
-# ── Pillar 4: Abstraction / Sleep (extract reusable sub-programs) ────────────
-_promoted = set()
-
-def sleep(solved, min_reuse=1):
-    subs = {}
-    for tid, prog in solved.items():
-        for ln in range(2, len(prog) + 1):
-            for i in range(len(prog) - ln + 1):
-                subs.setdefault(tuple(prog[i:i + ln]), set()).add(tid)
-    new = []
-    for chain, tids in sorted(subs.items(), key=lambda x: -len(x[1])):
-        if len(tids) < min_reuse or chain in _promoted: continue
-        _promoted.add(chain)
-        name = f"L{len(PRIMS)}"
-        PRIMS[name] = (lambda c: lambda g: run(c, g))(list(chain))
-        new.append((name, chain, len(tids)))
-    return new
-
-# ── Data loading ─────────────────────────────────────────────────────────────
-def load(path, n=400):
+def load(path):
+    """Load ARC tasks: {task_id: [(input, output), ...]}."""
     tasks = {}
-    for f in sorted(os.listdir(path))[:n]:
-        if f.endswith(".json"):
-            d = json.load(open(os.path.join(path, f)))
-            tasks[f[:-5]] = ([(e["input"], e["output"]) for e in d["train"]],
-                             [(e["input"], e["output"]) for e in d["test"]])
+    for f in sorted(Path(path).glob("*.json")):
+        t = json.loads(f.read_text())
+        tasks[f.stem] = [(e["input"], e["output"]) for e in t["train"]]
     return tasks
 
-# ── Compounding loop ─────────────────────────────────────────────────────────
+# ── Composition ──────────────────────────────────────────────────────
+def execute(program, grid):
+    """Run a program (list of primitive names) on a grid by chaining."""
+    for name in program:
+        grid = primitives[name](np.array(grid))
+    return grid
+
+# ── Feedback ─────────────────────────────────────────────────────────
+def error(program, examples):
+    """Score: 0.0 = solves all examples, 1.0 = total failure."""
+    wrong = sum(1 for inp, out in examples if execute(program, inp) != out)
+    return wrong / len(examples)
+
+# ── Exploration ──────────────────────────────────────────────────────
+def candidates(max_depth):
+    """Yield all programs up to max_depth primitives."""
+    names = list(primitives)
+    for depth in range(1, max_depth + 1):
+        for combo in itertools.product(names, repeat=depth):
+            yield list(combo)
+
+# ── Abstraction ──────────────────────────────────────────────────────
+def abstract(scored_programs):
+    """Promote recurring length-2 sub-programs, weighted by quality (1 - error).
+    Near-misses contribute proportionally, so good approximations compound."""
+    weights = {}
+    for prog, quality in scored_programs:
+        for i in range(len(prog) - 1):
+            pair = tuple(prog[i : i + 2])
+            weights[pair] = weights.get(pair, 0.0) + quality
+    new = []
+    for pair, weight in weights.items():
+        if weight >= 1.5 and pair not in primitives:
+            name = "_".join(pair)
+            primitives[name] = (lambda p: lambda g: execute(list(p), g))(pair)
+            new.append(name)
+    return new
+
+# ── The Loop ─────────────────────────────────────────────────────────
+def learn(tasks, rounds):
+    """Wake-sleep compounding: explore → feedback → abstract → repeat."""
+    for r in range(1, rounds + 1):
+        solved, best_programs = 0, []
+        for tid, examples in tasks.items():
+            best_err, best_prog = 1.0, None
+            for prog in candidates(max_depth=2):
+                err = error(prog, examples)
+                if err < best_err:
+                    best_err, best_prog = err, prog
+                    if err == 0.0:
+                        solved += 1
+                        break
+            if best_prog:
+                best_programs.append((best_prog, 1.0 - best_err))
+        new = abstract(best_programs)
+        approx = sum(1 for _, q in best_programs if 0 < q < 1)
+        print(f"Round {r}: {solved}/{len(tasks)} solved, {approx} near-misses, "
+              f"{len(primitives)} primitives (+{len(new)} new)")
+
+# ── Main ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else "data/ARC-AGI/data/training"
-    tasks = load(path, int(sys.argv[2]) if len(sys.argv) > 2 else 400)
-    n_base = len(PRIMS)
-    print(f"Loaded {len(tasks)} tasks, {n_base} primitives\n")
-
-    solved = {}
-    for rd in range(1, 6):
-        new = wake(tasks, max_depth=2, solved=solved)
-        solved.update(new)
-        lib = sleep(solved)
-        print(f"Round {rd}: {len(solved)}/{len(tasks)} solved "
-              f"(+{len(new)} new), {len(PRIMS) - n_base} learned")
-        for name, chain, cnt in lib:
-            print(f"  {name} = {' → '.join(chain)} ({cnt} tasks)")
-        if not new and not lib:
-            print("  converged"); break
-
-    print(f"\nFinal: {len(solved)}/{len(tasks)} solved, "
-          f"{len(PRIMS)} primitives ({len(PRIMS) - n_base} learned)")
+    rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+    if not os.path.isdir(path):
+        sys.exit(f"Data not found: {path}")
+    tasks = load(path)
+    print(f"Loaded {len(tasks)} tasks, {len(primitives)} primitives")
+    learn(tasks, rounds)

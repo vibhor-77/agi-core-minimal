@@ -1,50 +1,99 @@
-# agi-core-minimal
+# agi-core-minimal: The 5-Pillar Learning Loop
 
-4-pillar wake-sleep compounding loop for ARC-AGI-1 in **99 lines of Python**.
+**One algorithm. Five pillars. Compounding intelligence.**
 
-## The 4 Pillars
+```
+explore → feedback → abstract → repeat
+  │          │          │          │
+  │          │          │          └─ library grows, search shrinks, harder problems yield
+  │          │          └─ extract recurring sub-programs as new primitives (weighted by quality)
+  │          └─ continuous error signal: how close is a program?
+  └─ search the space of programs by composing primitives
+```
 
-1. **Primitives** — 12 atomic grid→grid transforms (rotate, flip, crop, tile, mirror, scale)
-2. **Composition** — Programs are chains of primitives: `f(g(x))` = `["f", "g"]`
-3. **Search (Wake)** — Enumerate all compositions up to depth-2, find programs that solve tasks
-4. **Abstraction (Sleep)** — Extract recurring sub-programs from solutions, promote them as new primitives
+Based on the research and principles proposed by [Vibhor Jain](https://github.com/vibhor-77).
 
-The **compounding loop**: each round's learned abstractions become the next round's building blocks, enabling deeper solutions without exponential search cost.
+## The 5 Pillars
 
-## Quickstart
+| Pillar | What it does | Code |
+|--------|-------------|------|
+| **Composition** | Programs are sequences of primitives; execute by chaining | `execute(program, grid) → grid` |
+| **Feedback** | Continuous error signal — how close is a program to solving a task? | `error(program, examples) → float` |
+| **Exploration** | Search the space of programs by composing primitives | `candidates(depth) → generator` |
+| **Approximability** | Near-miss programs are valuable — closer is better, even if imperfect | best program per task, quality = 1 - error |
+| **Abstraction** | Extract recurring sub-programs as new primitives, weighted by quality | `abstract(scored_programs) → [names]` |
+
+Each pillar is **one function** with a clear name and docstring. The learning loop ties them together.
+
+**Approximability is the key to compounding.** Even when a program doesn't solve a task, if it got *closer* than anything else, its sub-programs are worth promoting. A near-miss in round 1 becomes a stepping stone in round 2.
+
+## Quick Start
 
 ```bash
 # Clone ARC-AGI dataset
 git clone https://github.com/fchollet/ARC-AGI data/ARC-AGI
 
-# Run (all 400 training tasks)
+pip install numpy
+
+# Run the learning loop (3 rounds by default)
 python solve.py
 
-# Run on subset
+# Or specify data path and rounds
 python solve.py data/ARC-AGI/data/training 50
 ```
 
-## Example Output
+### What you'll see
 
 ```
-Loaded 400 tasks, 12 primitives
-
-Round 1: 21/400 solved (+21 new), 6 learned
-  L12 = mir_h → mir_v (3 tasks)
-  L13 = crop → tile_h (1 tasks)
-  ...
-Round 2: 22/400 solved (+1 new), 7 learned        ← compounding!
-  L18 = crop → L14 (1 tasks)                       ← depth-3 via promoted L14
-Round 3: 22/400 solved (+0 new), 7 learned
-  converged
-
-Final: 22/400 solved, 19 primitives (7 learned)
+Loaded 400 tasks, 5 primitives
+Round 1: 7/400 solved, 5 near-misses, 6 primitives (+1 new)
+Round 2: 7/400 solved, 5 near-misses, 6 primitives (+0 new)
+Round 3: 7/400 solved, 5 near-misses, 6 primitives (+0 new)
 ```
 
-Round 2 solves a task Round 1 couldn't by composing `crop` with `L14` (which encodes `flip_v → mir_v`). This is effectively a depth-3 program (`crop(flip_v(mir_v(x)))`) discovered at depth-2 search cost.
+The scaffolding starts with 5 primitives (rotate, flip, transpose). Accuracy comes from adding more primitives — the loop and architecture are what matter.
 
-## How It Works
+## How it works
 
-The key insight: promoting a depth-2 solution as a single primitive lets depth-2 search reach depth-3, depth-4, etc. Each round extends the effective search depth by 1 without exponential cost growth.
+### `solve.py` (~100 lines)
 
-With 12 primitives, depth-2 search tries 144 compositions per task. After promoting 6 abstractions (18 total primitives), depth-2 search tries 324 — linearly more, not exponentially. But the effective depth reached is now 3+.
+```
+docstring          — the 5 pillars, one sentence each
+Domain             — primitives dict + load()
+Composition        — execute(program, grid)
+Feedback           — error(program, examples)
+Exploration        — candidates(max_depth)
+Abstraction        — abstract(scored_programs)  ← quality-weighted, not just perfect solves
+The Loop           — learn(tasks, rounds)
+Main               — load tasks, call learn()
+```
+
+**Adding a new primitive** is one line in the `primitives` dict:
+
+```python
+"crop_top": lambda g: g[1:],
+```
+
+**Adding a new domain** means replacing `primitives` and `load()` — everything else stays the same.
+
+### The learning loop
+
+1. **WAKE** (explore + feedback): For each task, search for the best program — perfect solve or closest approximation.
+2. **SLEEP** (abstract): Extract recurring sub-programs from *all* best programs (solved and near-misses), weighted by quality.
+3. **REPEAT**: The grown library expands effective search depth — a depth-1 search over a promoted depth-2 composition reaches depth-3.
+
+This is the compounding mechanism: each round builds on the last. Near-misses contribute proportionally, so even failed attempts feed the next round.
+
+## Full System
+
+The minimal `solve.py` demonstrates the architecture. The full system lives at [agi-core](https://github.com/vibhor-77/agi-core) and adds:
+
+- 75 atomic primitives (transforms + perception + parameterized)
+- 10 wake phases (exhaustive enumeration + 9 ARC-specific strategies)
+- Bounded library with eviction and ROI tracking
+- Multi-domain support (ARC-AGI-1/2, Zork, list ops, symbolic math)
+- Interleaved train → eval pipeline with culture transfer
+
+## License
+
+MIT
