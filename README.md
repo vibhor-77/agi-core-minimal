@@ -1,31 +1,40 @@
-# agi-core-minimal: The 5-Pillar Learning Loop
+# agi-core-minimal: The 4-Pillar Learning Loop
 
-**One algorithm. Five pillars. Compounding intelligence.**
+**One algorithm. Four pillars. Compounding intelligence.**
 
 ```
-explore → feedback → abstract → repeat
-  │          │          │          │
-  │          │          │          └─ library grows, search shrinks, harder problems yield
-  │          │          └─ extract recurring sub-programs as new primitives (weighted by quality)
-  │          └─ continuous error signal: how close is a program?
-  └─ search the space of programs by composing primitives
+explore → feedback → keep best (even near-misses) → abstract → repeat
+    │         │              │                           │
+    │         │              │                           └─ promote sub-programs as new primitives
+    │         │              └─ approximability: imperfect attempts are valuable
+    │         └─ closed-loop error signal drives every decision
+    └─ search the space of programs by composing primitives
 ```
 
 Based on the research and principles proposed by [Vibhor Jain](https://github.com/vibhor-77).
 
-## The 5 Pillars
+## The 4 Pillars
 
-| Pillar | What it does | Code |
-|--------|-------------|------|
-| **Composition** | Programs are sequences of primitives; execute by chaining | `execute(program, grid) → grid` |
-| **Feedback** | Continuous error signal — how close is a program to solving a task? | `error(program, examples) → float` |
-| **Exploration** | Search the space of programs by composing primitives | `candidates(depth) → generator` |
-| **Approximability** | Near-miss programs are valuable — closer is better, even if imperfect | best program per task, quality = 1 - error |
-| **Abstraction** | Extract recurring sub-programs as new primitives, weighted by quality | `abstract(scored_programs) → [names]` |
+| # | Pillar | What it does | In the code |
+|---|--------|-------------|-------------|
+| 1 | **Feedback Loops** | Closed-loop error signal that drives the entire cycle — which programs to keep, which sub-programs to promote, when to stop | `error(program, examples) → float` |
+| 2 | **Approximability** | Near-miss programs are valuable — closer is better, even if imperfect. The loop keeps the *best* program per task, not just perfect solves | quality = 1 - error, fed into abstraction |
+| 3 | **Abstraction & Composition** | Two sides of one coin: *compose* programs from primitives, *abstract* recurring sub-programs back into new primitives | `execute(program, grid)` + `abstract(scored_programs)` |
+| 4 | **Exploration** | Search the space of programs by composing primitives at increasing depth | `candidates(max_depth) → generator` |
 
-Each pillar is **one function** with a clear name and docstring. The learning loop ties them together.
+**Why these 4 and not more?** Composition and abstraction are inseparable — composition builds programs *down* from primitives, abstraction lifts sub-programs *up* into new primitives. They're the same mechanism in two directions. Approximability is what makes the cycle compound: without it, only perfect solves feed abstraction and most tasks contribute nothing.
 
-**Approximability is the key to compounding.** Even when a program doesn't solve a task, if it got *closer* than anything else, its sub-programs are worth promoting. A near-miss in round 1 becomes a stepping stone in round 2.
+## How Compounding Works
+
+The loop runs multiple rounds. Each round:
+
+1. **Explore** (Pillar 4) — try all compositions of current primitives
+2. **Score** (Pillar 1) — feedback tells us how close each program got
+3. **Keep best** (Pillar 2) — even a 60%-correct program is valuable
+4. **Abstract** (Pillar 3) — sub-programs recurring across good attempts become new primitives
+5. **Repeat** — the library grows, so depth-2 search over promoted depth-2 compositions reaches depth-4
+
+The key: a near-miss in round 1 gets its sub-programs promoted. In round 2, those promoted primitives let exploration reach programs it couldn't before. That's compounding — even failures contribute.
 
 ## Quick Start
 
@@ -53,19 +62,17 @@ Round 3: 7/400 solved, 5 near-misses, 6 primitives (+0 new)
 
 The scaffolding starts with 5 primitives (rotate, flip, transpose). Accuracy comes from adding more primitives — the loop and architecture are what matter.
 
-## How it works
-
-### `solve.py` (~100 lines)
+## `solve.py` (~100 lines)
 
 ```
-docstring          — the 5 pillars, one sentence each
-Domain             — primitives dict + load()
-Composition        — execute(program, grid)
-Feedback           — error(program, examples)
-Exploration        — candidates(max_depth)
-Abstraction        — abstract(scored_programs)  ← quality-weighted, not just perfect solves
-The Loop           — learn(tasks, rounds)
-Main               — load tasks, call learn()
+docstring                — the 4 pillars, one sentence each
+Domain                   — primitives dict + load()
+Pillar 3a: Composition   — execute(program, grid)
+Pillar 1:  Feedback      — error(program, examples)
+Pillar 4:  Exploration   — candidates(max_depth)
+Pillar 3b: Abstraction   — abstract(scored_programs)  ← quality-weighted
+The Loop                 — learn(tasks, rounds)        ← Pillar 2 lives here
+Main                     — load tasks, call learn()
 ```
 
 **Adding a new primitive** is one line in the `primitives` dict:
@@ -75,14 +82,6 @@ Main               — load tasks, call learn()
 ```
 
 **Adding a new domain** means replacing `primitives` and `load()` — everything else stays the same.
-
-### The learning loop
-
-1. **WAKE** (explore + feedback): For each task, search for the best program — perfect solve or closest approximation.
-2. **SLEEP** (abstract): Extract recurring sub-programs from *all* best programs (solved and near-misses), weighted by quality.
-3. **REPEAT**: The grown library expands effective search depth — a depth-1 search over a promoted depth-2 composition reaches depth-3.
-
-This is the compounding mechanism: each round builds on the last. Near-misses contribute proportionally, so even failed attempts feed the next round.
 
 ## Full System
 
