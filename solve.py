@@ -719,7 +719,45 @@ def task_hypotheses(examples):
                 hypotheses.append((("inp", ("add", R, ("const", dr)),
                                           ("add", C, ("const", dc))), 1))
 
-    # 5. Geometric + recolor compositions
+    # 5. Dimension-aware hypotheses
+    h, w = out0.shape
+    # Mirror at various axes
+    for axis_c in set([w // 2, w - 1]):
+        AC = ("const", axis_c)
+        hypotheses.append((("get", R, ("sub", AC, C)), 1))
+        hypotheses.append((("if", ("get", R, C), ("get", R, C),
+                           ("get", R, ("sub", AC, C))), 1))
+    for axis_r in set([h // 2, h - 1]):
+        AR = ("const", axis_r)
+        hypotheses.append((("get", ("sub", AR, R), C), 1))
+        hypotheses.append((("if", ("get", R, C), ("get", R, C),
+                           ("get", ("sub", AR, R), C)), 1))
+    # Modular with actual grid dims
+    for div_r in set([h, h // 2, h // 3]) - {0}:
+        for div_c in set([w, w // 2, w // 3]) - {0}:
+            hypotheses.append((("inp", ("mod", R, ("const", div_r)),
+                                     ("mod", C, ("const", div_c))), 1))
+            hypotheses.append((("get", ("mod", R, ("const", div_r)),
+                                     ("mod", C, ("const", div_c))), 1))
+    # Column/row conditional: keep only one column/row (for extraction tasks)
+    if inp0.shape == out0.shape:
+        for k in range(min(w, 8)):
+            hypotheses.append((("if", ("eq", C, ("const", k)),
+                               ("get", R, C), ("const", 0)), 1))
+        for k in range(min(h, 8)):
+            hypotheses.append((("if", ("eq", R, ("const", k)),
+                               ("get", R, C), ("const", 0)), 1))
+    # Column shift: get(r, sub(K, c)) for dimension-based K values
+    for k in set([w - 1, w // 2, h - 1, h // 2]) - {0}:
+        K = ("const", k)
+        hypotheses.append((("get", R, ("sub", K, C)), 1))
+        hypotheses.append((("get", ("sub", K, R), C), 1))
+        # Conditional: if modular condition, shift
+        hypotheses.append((
+            ("if", ("mod", C, ("const", 2)),
+             ("get", R, ("sub", K, C)), ("get", R, C)), 1))
+
+    # 6. Geometric + recolor compositions
     if inp0.shape == out0.shape:
         MR, MC = ("max_r",), ("max_c",)
         flip_r = ("sub", ("sub", MR, ONE), R)
@@ -775,6 +813,29 @@ def seed_sweep(tasks, library):
                 best_t, best_p, best_f = tree, passes, f
         if tid not in solved:
             best_fit[tid] = (best_t, best_p, best_f)
+
+    # Quick refinement pass on top near-misses within seed sweep
+    refine_count = 0
+    near = [(tid, t, p, f) for tid, (t, p, f) in best_fit.items() if f > 0.85]
+    near.sort(key=lambda x: -x[3])
+    for tid, t, p, f in near[:40]:
+        examples = tasks[tid]["train"]
+        # Single round of node-level refinement
+        t2, f2 = refine(t, examples, library, p)
+        if f2 > f:
+            t, f = t2, f2
+        if solves(t, examples, library, p):
+            t = simplify(t, examples, library, p)
+            solved[tid] = (t, p)
+            del best_fit[tid]
+            refine_count += 1
+            p_str = f" x{p}" if p > 1 else ""
+            print(f"  ✓ {tid}{p_str} (refined): {gp.to_str(t)}")
+        else:
+            best_fit[tid] = (t, p, f)
+    if refine_count:
+        print(f"  Seed refinement: +{refine_count} solved")
+
     return solved, best_fit
 
 
@@ -792,13 +853,13 @@ def evolve(tasks, rounds, library, tasks_per_round=30):
     print(f"Seed sweep: {len(solved)}/{len(tasks)} solved, "
           f"{n_near} near, lib={len(library)}")
 
-    # Phase 1.5: refine high-fitness near-misses from seed sweep
+    # Phase 1.5: deeper refinement on remaining near-misses
     refine_count = 0
     near_misses = [(tid, t, p, f) for tid, (t, p, f) in best_fit.items() if f > 0.7]
     near_misses.sort(key=lambda x: -x[3])
-    for tid, t, p, f in near_misses[:80]:
+    for tid, t, p, f in near_misses[:60]:
         examples = tasks[tid]["train"]
-        # Try node-level refinement
+        # Multi-round node-level refinement
         for _ in range(3):
             t2, f2 = refine(t, examples, library, p)
             if f2 <= f:
@@ -809,7 +870,7 @@ def evolve(tasks, rounds, library, tasks_per_round=30):
                 solved[tid] = (t, p)
                 refine_count += 1
                 p_str = f" x{p}" if p > 1 else ""
-                print(f"  ✓ {tid}{p_str} (refined): {gp.to_str(t)}")
+                print(f"  ✓ {tid}{p_str} (deep-refined): {gp.to_str(t)}")
                 break
         # Try wrapping with n_count conditions
         if tid not in solved and f > 0.8:
