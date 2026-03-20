@@ -164,6 +164,21 @@ def make_seeds():
                      ("const", y), ("get", R, C)),
                     1
                 ))
+    # Color swaps: if x→y, also y→x
+    for x in range(gp.NUM_COLORS):
+        for y in range(x + 1, gp.NUM_COLORS):
+            seeds.append((
+                ("if", ("eq", ("get", R, C), ("const", x)), ("const", y),
+                 ("if", ("eq", ("get", R, C), ("const", y)), ("const", x),
+                  ("get", R, C))),
+                1
+            ))
+    # Non-zero recolors: if cell != 0, change to color
+    for y in range(1, gp.NUM_COLORS):
+        seeds.append((
+            ("if", ("get", R, C), ("const", y), ("get", R, C)),
+            1
+        ))
 
     # Multi-pass templates: neighbor-aware rules (2-3 passes)
     # "If any neighbor has color X, become X" — flood-fill-like
