@@ -198,11 +198,12 @@ def search_budget(prev_fitness):
 
 
 def search(examples, seed=None, seed_passes=1, library=None,
-           pop_size=None, gens=None):
+           pop_size=None, gens=None, transfer=None):
     """Evolve a (tree, passes) program for a single task.
 
     Population contains programs with varying pass counts. Evolution jointly
-    optimizes the tree structure and number of passes.
+    optimizes the tree structure and number of passes. Transfer programs from
+    other solved tasks are included as population seeds.
     Returns (best_tree, best_passes, best_fitness).
     """
     if pop_size is None or gens is None:
@@ -211,8 +212,14 @@ def search(examples, seed=None, seed_passes=1, library=None,
     all_seeds = make_seeds()
     pop_size = max(pop_size, len(all_seeds) + 20)
 
-    # Initialize population: seeds + mutations + random (with varied passes)
-    pop = list(all_seeds)  # (tree, passes) tuples
+    # Initialize population: seeds + transfer programs + mutations + random
+    pop = list(all_seeds)
+
+    # Transfer: include programs that solved other tasks + their mutations
+    if transfer:
+        for tree, passes in transfer:
+            pop.append((tree, passes))
+            pop.append((gp.mutate(tree, library=library), passes))
 
     n_mutants = pop_size // ELITE_FRACTION
     if seed is not None and seed != IDENTITY:
@@ -223,7 +230,7 @@ def search(examples, seed=None, seed_passes=1, library=None,
         pop.append((gp.mutate(IDENTITY, library=library), 1))
 
     while len(pop) < pop_size:
-        passes = np.random.choice([1, 1, 1, 1, 2, 2, 3])  # bias toward 1-pass
+        passes = np.random.choice([1, 1, 1, 1, 2, 2, 3])
         pop.append((gp.random_tree(max_depth=4, library=library), passes))
 
     # Track best
@@ -363,6 +370,9 @@ def evolve(tasks, rounds, library):
         tids = [t for t in tasks if t not in solved]
         tids.sort(key=lambda t: -(best_fit[t][2] if t in best_fit else 0))
 
+        # Collect unique solver programs for transfer to unsolved tasks
+        transfer_progs = list({id(v): v for v in solved.values()}.values())
+
         for tid in tids:
             prev_t = best_fit[tid][0] if tid in best_fit else None
             prev_p = best_fit[tid][1] if tid in best_fit else 1
@@ -370,7 +380,8 @@ def evolve(tasks, rounds, library):
             ps, gs = search_budget(prev_f)
             tree, passes, f = search(tasks[tid]["train"], seed=prev_t,
                                      seed_passes=prev_p, library=library,
-                                     pop_size=ps, gens=gs)
+                                     pop_size=ps, gens=gs,
+                                     transfer=transfer_progs)
             if f > best_fit.get(tid, (None, 0, 0))[2]:
                 best_fit[tid] = (tree, passes, f)
             if solves(tree, tasks[tid]["train"], library, passes):

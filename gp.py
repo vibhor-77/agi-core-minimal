@@ -25,7 +25,7 @@ import numpy as np
 
 # Domain-determined (not tunable — these follow from the problem definition)
 NUM_COLORS = 10                 # ARC uses colors 0–9
-NUM_TERMINALS = 4 + NUM_COLORS  # r, c, max_r, max_c + one per color
+NUM_TERMINALS = 5 + NUM_COLORS  # r, c, max_r, max_c, pass_num + one per color
 MAX_TREE_DEPTH = 7              # limits composition depth; 7 allows ~128 nodes
 MAX_PASSES = 5                  # maximum multi-pass iterations
 
@@ -47,7 +47,8 @@ _MUTATE_TOTAL = sum(MUTATE_WEIGHTS.values())
 
 # ── Tree structure ───────────────────────────────────────────────────
 # A node is a tuple: (op, child1, child2, ...)
-# Terminals: ("r",), ("c",), ("max_r",), ("max_c",), ("const", v), ("lib", name)
+# Terminals: ("r",), ("c",), ("max_r",), ("max_c",), ("pass_num",),
+#            ("const", v), ("lib", name)
 # Functions:
 ARITY = {
     "add": 2, "sub": 2, "mod": 2,    # arithmetic
@@ -71,7 +72,8 @@ def random_tree(max_depth=4, depth=0, library=None):
         if ch == 1: return ("c",)
         if ch == 2: return ("max_r",)
         if ch == 3: return ("max_c",)
-        return ("const", ch - 4)
+        if ch == 4: return ("pass_num",)
+        return ("const", ch - 5)
     ops = list(ARITY)
     op = ops[np.random.randint(len(ops))]
     children = [random_tree(max_depth, depth + 1, library) for _ in range(ARITY[op])]
@@ -126,7 +128,7 @@ def replace(tree, path, new):
 
 # ── Evaluation ───────────────────────────────────────────────────────
 
-def _evaluate_once(tree, g_current, g_original, out_shape, library):
+def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
     """Evaluate tree once for all output cells. Returns 2D int array or None."""
     cur_r, cur_c = g_current.shape
     orig_r, orig_c = g_original.shape
@@ -135,6 +137,7 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library):
     r_arr = np.broadcast_to(np.arange(o_r)[:, None], (o_r, o_c))
     c_arr = np.broadcast_to(np.arange(o_c)[None, :], (o_r, o_c))
     MR, MC = np.int64(o_r), np.int64(o_c)
+    PN = np.int64(pass_num)
     node_count = [0]
 
     def _eval(node):
@@ -147,6 +150,7 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library):
         if op == "c": return c_arr
         if op == "max_r": return MR
         if op == "max_c": return MC
+        if op == "pass_num": return PN
         if op == "const": return np.int64(node[1])
         if op == "lib":
             sub = (library or {}).get(node[1])
@@ -192,8 +196,8 @@ def evaluate(tree, input_grid, out_shape=None, library=None, passes=1):
     o_shape = out_shape if out_shape is not None else g_original.shape
     g_current = g_original
 
-    for _ in range(passes):
-        result = _evaluate_once(tree, g_current, g_original, o_shape, library)
+    for p in range(passes):
+        result = _evaluate_once(tree, g_current, g_original, o_shape, library, pass_num=p)
         if result is None:
             return None
         g_current = result
@@ -226,8 +230,8 @@ def mutate(tree, library=None):
         op = node[0]
         if op == "const":
             return replace(tree, path, ("const", np.random.randint(NUM_COLORS)))
-        if op in ("r", "c", "max_r", "max_c"):
-            terms = [("r",), ("c",), ("max_r",), ("max_c",),
+        if op in ("r", "c", "max_r", "max_c", "pass_num"):
+            terms = [("r",), ("c",), ("max_r",), ("max_c",), ("pass_num",),
                      ("const", np.random.randint(NUM_COLORS))]
             return replace(tree, path, terms[np.random.randint(len(terms))])
         if op in ARITY and ARITY[op] == 2:
