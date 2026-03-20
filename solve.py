@@ -198,6 +198,19 @@ def make_seeds():
                    ("get", ("sub", R, ONE), C)), 2))
     seeds.append((("if", ("get", R, C), ("get", R, C),
                    ("get", ("add", R, ONE), C)), 2))
+    # Row/column broadcast: fill output from a single row or column
+    for k in range(5):
+        K = ("const", k)
+        seeds.append((("get", K, C), 1))        # broadcast row k
+        seeds.append((("get", R, K), 1))        # broadcast column k
+    # Read from edges
+    seeds.append((("get", R, ("const", 0)), 1))              # first column
+    seeds.append((("get", R, ("sub", MC, ONE)), 1))           # last column
+    seeds.append((("get", ("const", 0), C), 1))               # first row
+    seeds.append((("get", ("sub", MR, ONE), C), 1))            # last row
+    # Conditional: if cell==0, read from first row/column
+    seeds.append((("if", ("get", R, C), ("get", R, C), ("get", ("const", 0), C)), 1))
+    seeds.append((("if", ("get", R, C), ("get", R, C), ("get", R, ("const", 0))), 1))
 
     # Multi-pass templates: neighbor-aware rules (2-3 passes)
     # "If any neighbor has color X, become X" — flood-fill-like
