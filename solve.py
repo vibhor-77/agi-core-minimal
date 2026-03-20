@@ -17,8 +17,8 @@ import gp
 # ── Constants ────────────────────────────────────────────────────────
 
 # Search budget (base values — actual budget scales continuously with fitness)
-POP_SIZE_BASE = 80              # population at fitness=0; doubles at fitness=1
-GENERATIONS_BASE = 15           # generations at fitness=0; doubles at fitness=1
+POP_SIZE_BASE = 60              # population at fitness=0; doubles at fitness=1
+GENERATIONS_BASE = 12           # generations at fitness=0; doubles at fitness=1
 ELITE_FRACTION = 5              # keep top 1/N of population as elite
 
 # Fitness function
@@ -209,26 +209,28 @@ def search(examples, seed=None, seed_passes=1, library=None,
     if pop_size is None or gens is None:
         pop_size, gens = POP_SIZE_BASE, GENERATIONS_BASE
 
-    all_seeds = make_seeds()
-    pop_size = max(pop_size, len(all_seeds) + 20)
+    # Always include seed templates for crossover material
+    pop = list(make_seeds())
 
-    # Initialize population: seeds + transfer programs + mutations + random
-    pop = list(all_seeds)
-
-    # Transfer: include programs that solved other tasks + their mutations
+    # Transfer: include programs that solved other tasks + mutations
     if transfer:
         for tree, passes in transfer:
             pop.append((tree, passes))
             pop.append((gp.mutate(tree, library=library), passes))
 
+    # Build from previous best (seed) via mutations
     n_mutants = pop_size // ELITE_FRACTION
     if seed is not None and seed != IDENTITY:
         pop.append((seed, seed_passes))
         for _ in range(n_mutants):
             pop.append((gp.mutate(seed, library=library), seed_passes))
+
+    # Identity mutations
     for _ in range(n_mutants):
         pop.append((gp.mutate(IDENTITY, library=library), 1))
 
+    # Fill rest with random trees (varied passes)
+    pop_size = max(pop_size, len(pop) + 10)
     while len(pop) < pop_size:
         passes = np.random.choice([1, 1, 1, 1, 2, 2, 3])
         pop.append((gp.random_tree(max_depth=4, library=library), passes))
@@ -356,21 +358,56 @@ def abstract(solvers, library):
 
 # ── Evolution loop ───────────────────────────────────────────────────
 
-def evolve(tasks, rounds, library):
+def seed_sweep(tasks, library):
+    """Fast first pass: test all seed templates on all tasks. No evolution.
+
+    Returns (solved_dict, best_fit_dict) with results from seeds alone.
+    This is cheap — ~100 seeds × N tasks × 3 examples — and finds all
+    tasks solvable by a single known transform.
+    """
+    seeds = make_seeds()
+    solved = {}
+    best_fit = {}
+    for tid, task in tasks.items():
+        examples = task["train"]
+        best_t, best_p, best_f = IDENTITY, 1, 0.0
+        for tree, passes in seeds:
+            if solves(tree, examples, library, passes):
+                tree = simplify(tree, examples, library, passes)
+                solved[tid] = (tree, passes)
+                p_str = f" x{passes}" if passes > 1 else ""
+                print(f"  ✓ {tid}{p_str}: {gp.to_str(tree)}")
+                break
+            f = fitness(tree, examples, library, passes)
+            if f > best_f:
+                best_t, best_p, best_f = tree, passes, f
+        if tid not in solved:
+            best_fit[tid] = (best_t, best_p, best_f)
+    return solved, best_fit
+
+
+def evolve(tasks, rounds, library, tasks_per_round=30):
     """Per-task evolution with cross-task abstraction.
 
-    Each round: evolve a (tree, passes) program for each unsolved task,
-    then abstract common subtrees from solvers into the library.
+    Phase 1: fast seed sweep on all tasks (finds tasks solvable by templates).
+    Phase 2: focused evolutionary search on top near-misses with larger budget.
     """
-    solved = {}       # tid → (tree, passes)
-    best_fit = {}     # tid → (tree, passes, fitness)
+    # Phase 1: seed sweep (fast — no evolution, all tasks)
+    solved, best_fit = seed_sweep(tasks, library)
+    if len(solved) >= MIN_SHARED_SOLVERS:
+        abstract(list(solved.values()), library)
+    n_near = sum(1 for v in best_fit.values() if v[2] > 0.8)
+    print(f"Seed sweep: {len(solved)}/{len(tasks)} solved, "
+          f"{n_near} near, lib={len(library)}")
 
+    # Phase 2: evolutionary search — bigger budget on fewer tasks
     for rnd in range(1, rounds + 1):
         new_count = 0
         tids = [t for t in tasks if t not in solved]
         tids.sort(key=lambda t: -(best_fit[t][2] if t in best_fit else 0))
+        if len(tids) > tasks_per_round:
+            tids = tids[:tasks_per_round]
 
-        # Collect unique solver programs for transfer to unsolved tasks
         transfer_progs = list({id(v): v for v in solved.values()}.values())
 
         for tid in tids:
@@ -442,7 +479,7 @@ def evaluate(tasks, library, train_solvers=None):
 if __name__ == "__main__":
     train_path = sys.argv[1] if len(sys.argv) > 1 else "data/ARC-AGI/data/training"
     eval_path  = sys.argv[2] if len(sys.argv) > 2 else "data/ARC-AGI/data/evaluation"
-    rounds     = int(sys.argv[3]) if len(sys.argv) > 3 else 20
+    rounds     = int(sys.argv[3]) if len(sys.argv) > 3 else 10
     if not os.path.isdir(train_path):
         sys.exit(f"Training data not found: {train_path}")
 
