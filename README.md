@@ -112,10 +112,27 @@ The primitive set is deliberately small (11 operations) but **universal** — an
 
 ## Current results
 
-- **22/400** training tasks solved in 3 rounds
-- Programs are genuinely discovered, not hand-coded
-- Library abstraction enables cross-task transfer
-- Near-miss count grows steadily across rounds (fitness improving on unsolved tasks)
+- **20-22/400** training tasks solved (seed sweep + 3-5 evolutionary rounds)
+- 12 library entries abstracted, reused in later solutions
+- 112 near-misses (fitness > 0.8) — the system is making partial progress on many tasks
+- Multi-pass programs discovered (2-pass gravity, 3-pass iterative refinement)
+
+### What works
+
+| Category | Examples | Count |
+|----------|---------|-------|
+| Geometric transforms | transpose, flip_h, flip_v, rotate | 6 |
+| Shifts | shift down by k, column tiling | 3 |
+| Color recoloring | if(cell==7, 5, cell), swap 5↔8 | 5 |
+| Conditional geometry | if(cell==0, flip_v, identity) | 3 |
+| Multi-pass | gravity (propagate down), iterative fill | 2 |
+| Compositions | conditional mirror, library-based combos | 3 |
+
+### What doesn't work (yet)
+
+The remaining ~380 tasks require **object-level reasoning** — identifying connected components, detecting patterns, counting objects, understanding spatial relationships. The cell-level primitives are universal in theory but the search space for object-level behaviors is too large for the current evolutionary budget.
+
+The principled path forward: multi-pass evaluation (already implemented) enables cellular-automata-like computation where local rules produce global behavior through iteration. The challenge is evolving the right local rules.
 
 ## License
 
