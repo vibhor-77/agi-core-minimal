@@ -45,20 +45,38 @@ def load(path):
         }
     return tasks
 
+# ── Execution cache ──────────────────────────────────────────────────
+_exec_cache = {}
+
+def _grid_key(grid):
+    """Hashable key for a grid (list-of-lists or ndarray)."""
+    a = np.asarray(grid)
+    return (a.shape, a.tobytes())
+
 # ── Pillar 3a: Composition (programs = chains of primitives) ─────────
 def execute(program, grid):
     """Run a program (list of primitive names) on a grid by chaining."""
+    prog_key = tuple(program)
+    grid_k = _grid_key(grid)
+    cache_key = (prog_key, grid_k)
+    if cache_key in _exec_cache:
+        return _exec_cache[cache_key]
+    result = grid
     for name in program:
         fn = primitives.get(name)
         if fn is None:
-            return None  # primitive was pruned; program is invalid
+            _exec_cache[cache_key] = None
+            return None
         try:
-            grid = fn(np.array(grid))
+            result = fn(np.array(result))
         except Exception:
+            _exec_cache[cache_key] = None
             return None
-        if grid is None:
+        if result is None:
+            _exec_cache[cache_key] = None
             return None
-    return grid
+    _exec_cache[cache_key] = result
+    return result
 
 # ── Pillar 1: Feedback Loops (continuous error signal) ───────────────
 def error(program, examples):
@@ -112,39 +130,32 @@ def mutate(prog):
         prog[np.random.randint(len(prog))] = np.random.choice(names)
     return prog
 
-def fitness(prog, tasks):
-    """Aggregate fitness: sum of (1 - error) across all tasks."""
-    total = 0.0
-    for tid, task in tasks.items():
-        err = error(prog, task["train"])
-        total += 1.0 - err
-    return total
-
 # ── Pillar 3b: Abstraction (promote solvers as new primitives) ───────
-def abstract(population, tasks):
-    """Promote programs that solve tasks as new primitives."""
+def abstract(solvers):
+    """Promote programs that solve 2+ tasks as new primitives."""
     probe = np.arange(12).reshape(3, 4).tolist()
+    # Count how many tasks each unique program solves
+    prog_counts = {}
+    for prog in solvers:
+        key = tuple(prog)
+        prog_counts[key] = prog_counts.get(key, 0) + 1
     new = []
-    for prog in population:
-        if len(prog) < 2:
+    for prog_t, count in prog_counts.items():
+        if len(prog_t) < 2 or count < 2:
             continue
-        name = "abs_" + "_".join(prog)
+        name = "abs_" + "_".join(prog_t)
         if name in primitives:
             continue
-        solves_any = any(error(prog, task["train"]) == 0.0
-                         for task in tasks.values())
-        if not solves_any:
-            continue
-        fn = (lambda p: lambda g: execute(list(p), g))(tuple(prog))
+        fn = (lambda p: lambda g: execute(list(p), g))(prog_t)
         if np.array_equal(fn(probe), probe):
             continue
         primitives[name] = fn
         new.append(name)
-        print(f"  ++ abstracted '{name}'")
+        print(f"  ++ abstracted '{name}' (solves {count} tasks)")
     return new
 
 def prune_primitives(population):
-    """Remove abstracted primitives unused by top-50% of population."""
+    """Remove abstracted primitives unused by the population."""
     base = {"rotate_cw","rotate_ccw","flip_h","flip_v","transpose","grav_down","shift_r","shift_d"}
     used = set()
     for prog in population:
@@ -155,51 +166,96 @@ def prune_primitives(population):
         print(f"  -- pruned '{n}'")
 
 # ── The Loop (evolutionary) ──────────────────────────────────────────
-def evolve(tasks, rounds, pop_size=200):
+def evolve(tasks, rounds, pop_size=300, sample_size=100):
     """Population-based evolutionary search with behavioral abstraction."""
+    all_tids = list(tasks.keys())
     population = [random_program() for _ in range(pop_size)]
+    all_solved = {}  # tid -> best program (persists across rounds)
+    # Track best error per task for near-miss seeding
+    best_per_task = {}  # tid -> (prog, err)
 
     for r in range(1, rounds + 1):
-        # Evaluate fitness
-        fitnesses = [fitness(prog, tasks) for prog in population]
+        # Sample tasks: bias toward unsolved + near-misses
+        unsolved = [t for t in all_tids if t not in all_solved]
+        near_miss = [t for t in unsolved if t in best_per_task and best_per_task[t][1] < 0.5]
+        # Prioritize near-misses, fill with random unsolved
+        priority = list(set(near_miss))
+        remaining = [t for t in unsolved if t not in set(priority)]
+        np.random.shuffle(remaining)
+        sample_tids = (priority + remaining)[:min(sample_size, len(unsolved))]
+        if not sample_tids:
+            sample_tids = list(np.random.choice(all_tids, size=sample_size, replace=False))
 
-        # Track solved tasks
-        solved = set()
-        best_per_task = {}
-        for prog, fit in zip(population, fitnesses):
-            for tid, task in tasks.items():
-                err = error(prog, task["train"])
-                if err == 0.0:
-                    solved.add(tid)
+        # Evaluate fitness on sampled tasks
+        fitnesses = []
+        for prog in population:
+            total = 0.0
+            for tid in sample_tids:
+                err = error(prog, tasks[tid]["train"])
+                total += 1.0 - err
+                if err == 0.0 and tid not in all_solved:
+                    all_solved[tid] = list(prog)
+                    print(f"  ✓ {tid} solved by {prog}")
+                # Track best per task
                 if tid not in best_per_task or err < best_per_task[tid][1]:
-                    best_per_task[tid] = (prog, err)
+                    best_per_task[tid] = (list(prog), err)
+            fitnesses.append(total)
 
-        for tid in solved:
-            prog = best_per_task[tid][0]
-            print(f"  ✓ {tid} solved by {prog}")
+        # Check non-sampled tasks with elite programs
+        elite_idxs = sorted(range(len(fitnesses)), key=lambda i: fitnesses[i], reverse=True)[:10]
+        for idx in elite_idxs:
+            prog = population[idx]
+            for tid in all_tids:
+                if tid in all_solved:
+                    continue
+                err = error(prog, tasks[tid]["train"])
+                if err == 0.0:
+                    all_solved[tid] = list(prog)
+                    print(f"  ✓ {tid} solved by {prog}")
+                if tid not in best_per_task or err < best_per_task[tid][1]:
+                    best_per_task[tid] = (list(prog), err)
 
-        # Behavioral abstraction: promote solvers as new primitives
-        abstract(population, tasks)
+        # Behavioral abstraction: promote solver programs that solve 2+ tasks
+        solver_progs = list(all_solved.values())
+        abstract(solver_progs)
 
         # Evolve next generation
         ranked = sorted(zip(fitnesses, population), reverse=True)
         elite_n = pop_size // 5
-        new_pop = [prog for _, prog in ranked[:elite_n]]
+        new_pop = [list(prog) for _, prog in ranked[:elite_n]]
+
+        # Seed with all known solvers
+        seen = {tuple(p) for p in new_pop}
+        for prog in all_solved.values():
+            key = tuple(prog)
+            if key not in seen:
+                new_pop.append(list(prog))
+                seen.add(key)
+
+        # Inject fresh random programs for diversity (10% of pop)
+        n_random = pop_size // 10
+        for _ in range(n_random):
+            new_pop.append(random_program())
+
+        # Fill rest with offspring
         while len(new_pop) < pop_size:
             p1 = tournament_select(population, fitnesses)
             p2 = tournament_select(population, fitnesses)
             child = crossover(p1, p2)
             child = mutate(child)
             new_pop.append(child)
-        population = new_pop
+        population = new_pop[:pop_size]
 
-        # Prune unused primitives every 3 rounds
-        if r % 3 == 0:
+        # Prune unused primitives every 5 rounds
+        if r % 5 == 0:
             prune_primitives(population)
+            # Trim cache to prevent unbounded memory growth
+            if len(_exec_cache) > 1000000:
+                _exec_cache.clear()
 
-        approx = sum(1 for _, (_, e) in best_per_task.items() if 0 < e < 1)
-        print(f"Round {r}: {len(solved)}/{len(tasks)} solved, "
-              f"{approx} near-misses, {len(primitives)} primitives")
+        n_near = sum(1 for t in unsolved if t in best_per_task and 0 < best_per_task[t][1] < 1)
+        print(f"Round {r}: {len(all_solved)}/{len(tasks)} solved, "
+              f"{n_near} near-misses, {len(primitives)} prims")
 
 # ── Evaluation (frozen primitives, held-out test) ─────────────────────
 def evaluate(tasks, generations=5, pop_size=100):
@@ -243,7 +299,7 @@ def evaluate(tasks, generations=5, pop_size=100):
 if __name__ == "__main__":
     train_path = sys.argv[1] if len(sys.argv) > 1 else "data/ARC-AGI/data/training"
     eval_path  = sys.argv[2] if len(sys.argv) > 2 else "data/ARC-AGI/data/evaluation"
-    rounds     = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+    rounds     = int(sys.argv[3]) if len(sys.argv) > 3 else 20
     if not os.path.isdir(train_path):
         sys.exit(f"Training data not found: {train_path}")
 
