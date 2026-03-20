@@ -10,7 +10,7 @@ The learning loop: explore → score → keep best (even near-misses) → abstra
 Compounding emerges because approximations feed abstraction, and abstractions
 widen what exploration can reach next round.
 """
-import json, sys, os, itertools, numpy as np
+import json, sys, os, numpy as np
 from pathlib import Path
 
 # ── Domain: ARC-AGI-1 ────────────────────────────────────────────────
@@ -21,6 +21,8 @@ primitives = {
     "flip_v":     lambda g: np.flipud(g).tolist(),
     "transpose":  lambda g: np.transpose(g).tolist(),
 }
+
+_prim_score = {}  # primitive name -> cumulative usefulness
 
 def load(path):
     """Load ARC tasks: {task_id: [(input, output), ...]}."""
@@ -39,19 +41,24 @@ def execute(program, grid):
 
 # ── Pillar 1: Feedback Loops (continuous error signal) ───────────────
 def error(program, examples):
-    """Score: 0.0 = solves all examples, 1.0 = total failure.
-    This is the feedback signal that drives every decision in the loop:
-    which programs to keep, which sub-programs to promote, when to stop."""
-    wrong = sum(1 for inp, out in examples if execute(program, inp) != out)
-    return wrong / len(examples)
+    """Score: 0.0 = solves all, 1.0 = total failure. Cell-level granularity."""
+    total = 0.0
+    for inp, out in examples:
+        got = execute(program, inp)
+        out, got = np.array(out), np.array(got)
+        if out.shape == got.shape:
+            total += np.mean(out == got)
+    return 1.0 - total / len(examples)
 
 # ── Pillar 4: Exploration (search by composing primitives) ───────────
-def candidates(max_depth):
-    """Yield all programs up to max_depth primitives."""
+def candidates(max_depth, budget=200):
+    """Sample programs weighted by primitive usefulness (explore/exploit)."""
     names = list(primitives)
+    scores = np.array([_prim_score.get(n, 1.0) for n in names])
+    weights = scores / scores.sum()
     for depth in range(1, max_depth + 1):
-        for combo in itertools.product(names, repeat=depth):
-            yield list(combo)
+        for _ in range(budget):
+            yield list(np.random.choice(names, size=depth, p=weights))
 
 # ── Pillar 3b: Abstraction (promote sub-programs as new primitives) ──
 def abstract(scored_programs):
@@ -92,6 +99,10 @@ def learn(tasks, rounds):
             # Pillar 2: Approximability — keep best even if imperfect
             if best_prog:
                 best_programs.append((best_prog, 1.0 - best_err))
+        # Update primitive scores based on usefulness
+        for prog, quality in best_programs:
+            for name in prog:
+                _prim_score[name] = _prim_score.get(name, 1.0) + quality
         # Pillar 3: Abstraction — promote recurring sub-programs
         new = abstract(best_programs)
         approx = sum(1 for _, q in best_programs if 0 < q < 1)
