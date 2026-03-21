@@ -421,6 +421,34 @@ def make_seeds():
         CV = ("const", color)
         seeds.append((("if", ("n_count8", R, C, CV), CV, ("get", R, C)), 2))
 
+    # ── Object-relative coordinate seeds ─────────────────────────────────
+    # Relative position within object bounding box
+    obj_rel_r = ("sub", R, ("obj_top", R, C))      # row within object
+    obj_rel_c = ("sub", C, ("obj_left", R, C))      # col within object
+    obj_h = ("sub", ("obj_bottom", R, C), ("obj_top", R, C))   # object height
+    obj_w = ("sub", ("obj_right", R, C), ("obj_left", R, C))   # object width
+    # If in object, read from mirror position within bounding box
+    seeds.append((("if", ("obj_id", R, C),
+                   ("inp", ("sub", ("obj_bottom", R, C), obj_rel_r),
+                           ("sub", ("obj_right", R, C), obj_rel_c)),
+                   ("const", 0)), 1))
+    # Recolor based on relative position: checkerboard within object
+    seeds.append((("if", ("obj_id", R, C),
+                   ("if", ("mod", ("add", obj_rel_r, obj_rel_c), ("const", 2)),
+                    ("obj_color", R, C), ("const", 0)),
+                   ("const", 0)), 1))
+    # Keep cells at the center of their object (not on boundary)
+    seeds.append((("if", ("obj_id", R, C),
+                   ("if", ("gt", obj_rel_r, ("const", 0)),
+                    ("if", ("gt", obj_rel_c, ("const", 0)),
+                     ("if", ("gt", obj_h, obj_rel_r),
+                      ("if", ("gt", obj_w, obj_rel_c),
+                       ("get", R, C), ("const", 0)),
+                      ("const", 0)),
+                     ("const", 0)),
+                    ("const", 0)),
+                   ("const", 0)), 1))
+
     return seeds
 
 
@@ -546,11 +574,16 @@ def search(examples, seed=None, seed_passes=1, library=None,
             best_t, best_f = t2, f2
             if best_f >= 1.0:
                 break
-    # Error-driven refinement for high-fitness near-misses
+    # Error-driven refinement for high-fitness near-misses (iterative — each
+    # round fixes a different error region, building on the previous fix)
     if 0.5 < best_f < 1.0:
-        t2, f2 = error_driven_refine(best_t, examples, library, best_p)
-        if f2 > best_f:
+        for _ in range(3):
+            t2, f2 = error_driven_refine(best_t, examples, library, best_p)
+            if f2 <= best_f:
+                break
             best_t, best_f = t2, f2
+            if best_f >= 1.0:
+                break
     return best_t, best_p, best_f
 
 
@@ -812,6 +845,12 @@ def error_driven_refine(tree, examples, library=None, passes=1):
     # For each condition, check if it discriminates errors from correct cells
     best_t, best_f = tree, fitness(tree, examples, library, passes)
 
+    # Fix values to try when patching error cells
+    fix_values = [("const", i) for i in range(gp.NUM_COLORS)]
+    fix_values.append(("inp", R, C))
+    fix_values.append(("get", flip_r, C))
+    fix_values.append(("get", R, flip_c))
+
     for _cname, cond_tree in conditions:
         # Check discrimination on each example
         cond_true_at_errors = True
@@ -849,12 +888,6 @@ def error_driven_refine(tree, examples, library=None, passes=1):
         if not orientations:
             continue
 
-        # Try fix values
-        fix_values = [("const", i) for i in range(gp.NUM_COLORS)]
-        fix_values.append(("inp", R, C))
-        fix_values.append(("get", flip_r, C))
-        fix_values.append(("get", R, flip_c))
-
         # Check if expected output at error cells is consistent
         consistent_expected = True
         expected_val = None
@@ -884,6 +917,46 @@ def error_driven_refine(tree, examples, library=None, passes=1):
                 f = fitness(candidate, examples, library, passes)
                 if f > best_f:
                     best_t, best_f = candidate, f
+
+    # Compound conditions: try pairwise AND/OR of conditions that individually helped
+    # This discovers "apply fix in region r >= A AND r <= B" which single conditions miss
+    improving_conds = []
+    for _cname, cond_tree in conditions:
+        for fix in fix_values:
+            cand_a = ("if", cond_tree, fix, tree)
+            cand_b = ("if", cond_tree, tree, fix)
+            for cand in [cand_a, cand_b]:
+                if gp.depth(cand) <= gp.MAX_TREE_DEPTH:
+                    f = fitness(cand, examples, library, passes)
+                    if f > best_f * 0.99:  # near-improving or improving
+                        improving_conds.append((_cname, cond_tree, fix, f))
+                        break
+        if len(improving_conds) >= 8:
+            break
+    # Try pairwise combinations of top improving conditions
+    improving_conds.sort(key=lambda x: -x[3])
+    for i in range(min(6, len(improving_conds))):
+        _, cond_a, fix_a, _ = improving_conds[i]
+        for j in range(i + 1, min(6, len(improving_conds))):
+            _, cond_b, fix_b, _ = improving_conds[j]
+            # AND: if(cond_a, if(cond_b, fix, tree), tree)
+            for fix in [fix_a, fix_b]:
+                cand = ("if", cond_a, ("if", cond_b, fix, tree), tree)
+                if gp.depth(cand) <= gp.MAX_TREE_DEPTH:
+                    if solves(cand, examples, library, passes):
+                        return simplify(cand, examples, library, passes), 1.0
+                    f = fitness(cand, examples, library, passes)
+                    if f > best_f:
+                        best_t, best_f = cand, f
+            # OR: if(cond_a, fix, if(cond_b, fix, tree))
+            for fix in [fix_a, fix_b]:
+                cand = ("if", cond_a, fix, ("if", cond_b, fix, tree))
+                if gp.depth(cand) <= gp.MAX_TREE_DEPTH:
+                    if solves(cand, examples, library, passes):
+                        return simplify(cand, examples, library, passes), 1.0
+                    f = fitness(cand, examples, library, passes)
+                    if f > best_f:
+                        best_t, best_f = cand, f
 
     # Also try subtree-level wrapping for smaller fixes
     for path, sub in gp.subtrees(tree):
@@ -973,7 +1046,7 @@ def task_hypotheses(examples):
                 break
         if consistent and color_map:
             changed = {k: v for k, v in color_map.items() if k != v}
-            if 0 < len(changed) <= 4:
+            if 0 < len(changed) <= 9:
                 tree = ("get", R, C)
                 for src, dst in changed.items():
                     tree = ("if", ("eq", ("get", R, C), ("const", src)),
@@ -1066,16 +1139,62 @@ def task_hypotheses(examples):
                         ("if", ("get", R, C), ("get", R, C),
                          ("if", ("n_count", R, C, FC), FC, ("get", R, C))), 3))
 
-    # 4. For diff-size: try cropping to subregion containing non-background
+    # 4. For diff-size: systematic output size inference
     if inp0.shape != out0.shape:
         or0, oc0 = out0.shape
-        # Try reading input from various offsets
-        for dr in range(min(5, inp0.shape[0] - or0 + 1) if inp0.shape[0] > or0 else 1):
-            for dc in range(min(5, inp0.shape[1] - oc0 + 1) if inp0.shape[1] > oc0 else 1):
-                if dr == 0 and dc == 0:
-                    continue
-                hypotheses.append((("inp", ("add", R, ("const", dr)),
-                                          ("add", C, ("const", dc))), 1))
+        ir0, ic0 = inp0.shape
+
+        # 4a. Cropping: try all valid offsets (not just 0-4)
+        if ir0 >= or0 and ic0 >= oc0:
+            for dr in range(ir0 - or0 + 1):
+                for dc in range(ic0 - oc0 + 1):
+                    hypotheses.append((("inp", ("add", R, ("const", dr)),
+                                              ("add", C, ("const", dc))), 1))
+
+        # 4b. Find non-background bounding box and crop to it
+        bg = int(np.argmax(np.bincount(inp0.flat)))
+        non_bg = inp0 != bg
+        if non_bg.any():
+            rows = np.where(non_bg.any(axis=1))[0]
+            cols = np.where(non_bg.any(axis=0))[0]
+            if len(rows) and len(cols):
+                top, bot = int(rows[0]), int(rows[-1])
+                left, right = int(cols[0]), int(cols[-1])
+                bb_h, bb_w = bot - top + 1, right - left + 1
+                # If bounding box matches output size, crop to it
+                if bb_h == or0 and bb_w == oc0:
+                    hypotheses.append((("inp", ("add", R, ("const", top)),
+                                              ("add", C, ("const", left))), 1))
+                # Try each non-bg color's bounding box
+                for color in range(1, gp.NUM_COLORS):
+                    cmask = inp0 == color
+                    if not cmask.any():
+                        continue
+                    cr = np.where(cmask.any(axis=1))[0]
+                    cc = np.where(cmask.any(axis=0))[0]
+                    ct, cl = int(cr[0]), int(cc[0])
+                    ch, cw = int(cr[-1]) - ct + 1, int(cc[-1]) - cl + 1
+                    if ch == or0 and cw == oc0:
+                        hypotheses.append((("inp", ("add", R, ("const", ct)),
+                                                  ("add", C, ("const", cl))), 1))
+
+        # 4c. Consistent offset across all examples
+        offsets = []
+        for inp, out in examples:
+            ia, oa = np.asarray(inp), np.asarray(out)
+            if ia.shape[0] >= oa.shape[0] and ia.shape[1] >= oa.shape[1]:
+                # Try to find the offset where input subgrid matches output
+                best_dr, best_dc, best_match = 0, 0, -1
+                for dr in range(ia.shape[0] - oa.shape[0] + 1):
+                    for dc in range(ia.shape[1] - oa.shape[1] + 1):
+                        match = np.sum(ia[dr:dr+oa.shape[0], dc:dc+oa.shape[1]] == oa)
+                        if match > best_match:
+                            best_dr, best_dc, best_match = dr, dc, match
+                offsets.append((best_dr, best_dc))
+        if offsets and all(o == offsets[0] for o in offsets):
+            dr, dc = offsets[0]
+            hypotheses.append((("inp", ("add", R, ("const", dr)),
+                                      ("add", C, ("const", dc))), 1))
 
     # 5. Dimension-aware hypotheses
     h, w = out0.shape

@@ -68,6 +68,7 @@ _MUTATE_TOTAL = sum(MUTATE_WEIGHTS.values())
 ARITY = {
     "add": 2, "sub": 2, "mod": 2,    # arithmetic
     "eq": 2, "gt": 2,                 # comparison
+    "min": 2, "max_": 2,              # min(a,b) = if(gt(a,b),b,a); search shortcut
     "get": 2,                          # read current grid (changes each pass)
     "inp": 2,                          # read original input (constant across passes)
     "if": 3,                           # conditional
@@ -343,6 +344,8 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
         if op == "mod": return np.mod(a, np.where(b == 0, 1, b))
         if op == "eq": return (a == b).astype(np.int64)
         if op == "gt": return (a > b).astype(np.int64)
+        if op == "min": return np.minimum(a, b)
+        if op == "max_": return np.maximum(a, b)
         if op == "get":
             ri = np.clip(np.broadcast_to(np.asarray(a), (o_r, o_c)), 0, cur_r - 1).astype(int)
             ci = np.clip(np.broadcast_to(np.asarray(b), (o_r, o_c)), 0, cur_c - 1).astype(int)
