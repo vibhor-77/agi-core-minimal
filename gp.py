@@ -21,10 +21,12 @@ Derived primitives (provably equivalent to compositions of atomics):
                 col_count(c, v)        (count of color v in column c)
   Global:       total_count(v)         (count of color v in input)
                 mode_color             (most common color in input)
-  Object (4-conn): obj_id/size/color/top/left/bottom/right(r, c)
-                obj_count, max_obj_size
-  Object (8-conn): obj8_id/size/color/top/left/bottom/right(r, c)
-                obj8_count, max_obj8_size
+  Object:       obj_id(r, c)           (connected component ID, 0=background)
+                obj_size(r, c)         (cell count of component at (r,c))
+                obj_color(r, c)        (color of component at (r,c))
+                obj_top/left/bottom/right(r, c)  (bounding box of component)
+                obj_count              (number of non-background components)
+                max_obj_size           (size of largest component)
 
 Multi-pass: when passes > 1, the tree is applied repeatedly. Each pass reads
 its own output from the previous pass via `get`, while `inp` always reads the
@@ -38,7 +40,7 @@ import numpy as np
 
 # Domain-determined (not tunable — these follow from the problem definition)
 NUM_COLORS = 10                 # ARC uses colors 0–9
-NUM_TERMINALS = 13 + NUM_COLORS  # r, c, max_r, max_c, inp_r, inp_c, pass_num, mode_color, obj_count, max_obj_size, obj8_count, max_obj8_size + colors
+NUM_TERMINALS = 11 + NUM_COLORS  # r, c, max_r, max_c, inp_r, inp_c, pass_num, mode_color, obj_count, max_obj_size + colors
 MAX_TREE_DEPTH = 7              # limits composition depth; 7 allows ~128 nodes
 MAX_PASSES = 5                  # maximum multi-pass iterations
 
@@ -76,19 +78,15 @@ ARITY = {
     "col_count": 2,                    # count of cells in col c with color v
     "total_count": 1,                  # count of all cells with color v in input
     # Object (connected component) primitives — computed on g_original via BFS
-    "obj_id": 2, "obj_size": 2, "obj_color": 2,       # 4-connectivity
-    "obj_top": 2, "obj_left": 2, "obj_bottom": 2, "obj_right": 2,
-    "obj8_id": 2, "obj8_size": 2, "obj8_color": 2,    # 8-connectivity
-    "obj8_top": 2, "obj8_left": 2, "obj8_bottom": 2, "obj8_right": 2,
+    "obj_id": 2, "obj_size": 2, "obj_color": 2,       # component identity
+    "obj_top": 2, "obj_left": 2, "obj_bottom": 2, "obj_right": 2,  # bounding box
 }
 
 _OBJ_OPS = {"obj_id", "obj_size", "obj_color", "obj_top", "obj_left", "obj_bottom", "obj_right"}
-_OBJ8_OPS = {"obj8_id", "obj8_size", "obj8_color", "obj8_top", "obj8_left", "obj8_bottom", "obj8_right"}
 _OBJ_TERMINALS = {"obj_count", "max_obj_size"}
-_OBJ8_TERMINALS = {"obj8_count", "max_obj8_size"}
 
 def uses_obj(tree):
-    """Check if tree references any obj_* op or terminal (4-conn)."""
+    """Check if tree references any obj_* op or terminal."""
     op = tree[0]
     if op in _OBJ_OPS or op in _OBJ_TERMINALS:
         return True
@@ -96,17 +94,6 @@ def uses_obj(tree):
         return True  # conservative: library entries might use obj
     if op in ARITY:
         return any(uses_obj(tree[i]) for i in range(1, 1 + ARITY[op]))
-    return False
-
-def uses_obj8(tree):
-    """Check if tree references any obj8_* op or terminal (8-conn)."""
-    op = tree[0]
-    if op in _OBJ8_OPS or op in _OBJ8_TERMINALS:
-        return True
-    if op == "lib":
-        return True
-    if op in ARITY:
-        return any(uses_obj8(tree[i]) for i in range(1, 1 + ARITY[op]))
     return False
 
 
@@ -129,9 +116,7 @@ def random_tree(max_depth=4, depth=0, library=None):
         if ch == 7: return ("mode_color",)
         if ch == 8: return ("obj_count",)
         if ch == 9: return ("max_obj_size",)
-        if ch == 10: return ("obj8_count",)
-        if ch == 11: return ("max_obj8_size",)
-        return ("const", ch - 12)
+        return ("const", ch - 10)
     ops = list(ARITY)
     op = ops[np.random.randint(len(ops))]
     children = [random_tree(max_depth, depth + 1, library) for _ in range(ARITY[op])]
@@ -186,20 +171,12 @@ def replace(tree, path, new):
 
 # ── Evaluation ───────────────────────────────────────────────────────
 
-_ccl_cache = {}   # (grid_bytes, conn) -> (label_map, obj_maps, OBJ_COUNT, MAX_OBJ_SIZE)
+_ccl_cache = {}  # grid_bytes -> (label_map, obj_maps, OBJ_COUNT, MAX_OBJ_SIZE)
 
-_NEIGHBORS_4 = ((-1,0),(1,0),(0,-1),(0,1))
-_NEIGHBORS_8 = ((-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1))
-
-def _get_ccl(g_original, connectivity=4):
-    """Compute and cache connected component labeling for a grid.
-
-    connectivity: 4 for cardinal-only, 8 for cardinal+diagonal.
-    """
-    key = (g_original.tobytes(), connectivity)
+def _get_ccl(g_original):
+    """Compute and cache connected component labeling for a grid."""
+    key = g_original.tobytes()
     if key not in _ccl_cache:
-        neighbors = _NEIGHBORS_4 if connectivity == 4 else _NEIGHBORS_8
-        prefix = "obj" if connectivity == 4 else "obj8"
         orig_r, orig_c = g_original.shape
         _label_map = np.zeros((orig_r, orig_c), dtype=np.int64)
         _comp_size = {}
@@ -223,7 +200,7 @@ def _get_ccl(g_original, connectivity=4):
                     if _qr > _b: _b = _qr
                     if _qc < _l: _l = _qc
                     if _qc > _ri: _ri = _qc
-                    for _dr, _dc in neighbors:
+                    for _dr, _dc in ((-1,0),(1,0),(0,-1),(0,1)):
                         _nr, _nc = _qr+_dr, _qc+_dc
                         if 0 <= _nr < orig_r and 0 <= _nc < orig_c and _label_map[_nr, _nc] == 0 and g_original[_nr, _nc] == _color:
                             _label_map[_nr, _nc] = _lbl
@@ -251,10 +228,9 @@ def _get_ccl(g_original, connectivity=4):
         OBJ_COUNT = np.int64(len(_comp_size))
         MAX_OBJ_SIZE = np.int64(max(_comp_size.values())) if _comp_size else np.int64(0)
         _obj_maps = {
-            f"{prefix}_id": _label_map, f"{prefix}_size": _obj_size_map,
-            f"{prefix}_color": _obj_color_map,
-            f"{prefix}_top": _obj_top_map, f"{prefix}_left": _obj_left_map,
-            f"{prefix}_bottom": _obj_bottom_map, f"{prefix}_right": _obj_right_map,
+            "obj_id": _label_map, "obj_size": _obj_size_map, "obj_color": _obj_color_map,
+            "obj_top": _obj_top_map, "obj_left": _obj_left_map,
+            "obj_bottom": _obj_bottom_map, "obj_right": _obj_right_map,
         }
         _ccl_cache[key] = (_label_map, _obj_maps, OBJ_COUNT, MAX_OBJ_SIZE)
         if len(_ccl_cache) > 500:
@@ -328,17 +304,12 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
     MODE_COLOR = np.int64(np.argmax(global_hist))
 
     # ── Connected component labeling (cached, only if tree uses obj_* ops) ──
-    _obj_maps = {}
-    OBJ_COUNT = np.int64(0)
-    MAX_OBJ_SIZE = np.int64(0)
-    OBJ8_COUNT = np.int64(0)
-    MAX_OBJ8_SIZE = np.int64(0)
     if uses_obj(tree):
-        _label_map, _maps4, OBJ_COUNT, MAX_OBJ_SIZE = _get_ccl(g_original, 4)
-        _obj_maps.update(_maps4)
-    if uses_obj8(tree):
-        _label_map8, _maps8, OBJ8_COUNT, MAX_OBJ8_SIZE = _get_ccl(g_original, 8)
-        _obj_maps.update(_maps8)
+        _label_map, _obj_maps, OBJ_COUNT, MAX_OBJ_SIZE = _get_ccl(g_original)
+    else:
+        _obj_maps = {}
+        OBJ_COUNT = np.int64(0)
+        MAX_OBJ_SIZE = np.int64(0)
 
     def _eval(node):
         node_count[0] += 1
@@ -357,8 +328,6 @@ def _evaluate_once(tree, g_current, g_original, out_shape, library, pass_num=0):
         if op == "mode_color": return MODE_COLOR
         if op == "obj_count": return OBJ_COUNT
         if op == "max_obj_size": return MAX_OBJ_SIZE
-        if op == "obj8_count": return OBJ8_COUNT
-        if op == "max_obj8_size": return MAX_OBJ8_SIZE
         if op == "lib":
             sub = (library or {}).get(node[1])
             return _eval(sub) if sub is not None else np.int64(0)
@@ -481,14 +450,10 @@ def _random_condition():
             ("eq", ("n_count", R, C, V), ("const", 0)),
             ("gt", ("n_count8", R, C, V), K2),
             ("eq", ("n_count8", R, C, V), ("const", 0)),
-            # Object (4-conn)
+            # Object
             ("gt", ("obj_size", R, C), K2),
             ("eq", ("obj_color", R, C), K),
             ("eq", ("obj_size", R, C), K2),
-            # Object (8-conn)
-            ("gt", ("obj8_size", R, C), K2),
-            ("eq", ("obj8_color", R, C), K),
-            ("eq", ("obj8_size", R, C), K2),
             # Row/col
             ("gt", ("row_count", R, V), ("const", 0)),
             ("gt", ("col_count", C, V), ("const", 0)),
@@ -513,10 +478,9 @@ def mutate(tree, library=None):
         if op == "const":
             return replace(tree, path, ("const", np.random.randint(NUM_COLORS)))
         if op in ("r", "c", "max_r", "max_c", "inp_r", "inp_c", "pass_num", "mode_color",
-                  "obj_count", "max_obj_size", "obj8_count", "max_obj8_size"):
+                  "obj_count", "max_obj_size"):
             terms = [("r",), ("c",), ("max_r",), ("max_c",), ("inp_r",), ("inp_c",),
                      ("pass_num",), ("mode_color",), ("obj_count",), ("max_obj_size",),
-                     ("obj8_count",), ("max_obj8_size",),
                      ("const", np.random.randint(NUM_COLORS))]
             return replace(tree, path, terms[np.random.randint(len(terms))])
         if op in ARITY and ARITY[op] == 2:

@@ -30,7 +30,7 @@ Every program is built from atomic operations plus derived perception layers:
 | **Constants** | `0`–`9` | The 10 ARC color values |
 | **Arithmetic** | `add`, `sub`, `mod` | Compute positions (mirror, shift, wrap) |
 | **Logic** | `eq`, `gt`, `if` | Compare values and branch |
-| **Neighborhood** | `n_count(r, c, v)` | Count of 4-neighbors with color v |
+| **Neighborhood** | `n_count(r, c, v)`, `n_count8(r, c, v)` | Count of 4/8-neighbors with color v |
 | **Aggregation** | `row_count(r, v)`, `col_count(c, v)`, `total_count(v)`, `mode_color` | Row/col/global color counts |
 | **Object** | `obj_id(r,c)`, `obj_size(r,c)`, `obj_color(r,c)`, `obj_top/left/bottom/right(r,c)`, `obj_count`, `max_obj_size` | Connected component properties |
 
@@ -107,17 +107,17 @@ The system avoids hard cutoffs wherever possible:
 | `TOURNAMENT_K` | 4 | Gives ~75% chance of selecting from the top quartile. Standard GP range is 2–7. |
 | `CHANGED_CELL_WEIGHT` | 3.0 | In typical ARC tasks, ~10-20% of cells change. Weight of 3 means a program must fix ~75% of changed cells to beat identity — creating a gradient above the identity plateau. |
 | `PARSIMONY_PENALTY` | 0.002 | A 50-node tree loses ~0.1 fitness. Enough to prefer simpler programs among equals, not enough to prevent finding complex solutions. |
-| `MUTATE_WEIGHTS` | 5:3:2 | Subtree mutation is most exploratory, point mutation is conservative, hoist simplifies. Weights follow the big-medium-small mutation spectrum from GP literature. |
+| `MUTATE_WEIGHTS` | 4:3:2:3 | Subtree (exploratory), point (conservative), hoist (simplifies), graft (wraps in conditional). Follows the big-medium-small mutation spectrum from GP literature. |
 
 ### Minimal and universal
 
-The primitive set is deliberately small (18 function ops + 11 terminals) but **universal** — any computable grid transformation can be expressed. The goal is not to add domain-specific primitives but to build a mechanism that discovers useful compositions from atomic operations.
+The primitive set is deliberately small (20 function ops + 11 terminals) but **universal** — any computable grid transformation can be expressed. The goal is not to add domain-specific primitives but to build a mechanism that discovers useful compositions from atomic operations.
 
 ## Current results
 
-- **30/400** training tasks solved (seed sweep + refinement + 2 evolutionary rounds)
-- 13 library entries abstracted, reused in later solutions
-- 129 near-misses (fitness > 0.8) — the system is making partial progress on many tasks
+- **38/400** training tasks solved (seed sweep + refinement + 1 evolutionary round)
+- 21 library entries abstracted, reused in later solutions
+- 125 near-misses (fitness > 0.8) — the system is making partial progress on many tasks
 - Multi-pass programs discovered (2-pass gravity, 3-pass iterative refinement)
 - Object-level primitives: connected component detection enables size-based filtering, object selection
 
@@ -137,7 +137,7 @@ The primitive set is deliberately small (18 function ops + 11 terminals) but **u
 
 ### What doesn't work (yet)
 
-The remaining ~370 tasks require more complex reasoning. Object primitives now enable basic component detection and size filtering, but many tasks need: shape analysis (rectangle vs. irregular), 8-connectivity grouping, relative positioning between objects, pattern matching within objects, and multi-object spatial relationships.
+The remaining ~360 tasks require more complex reasoning. Object primitives enable component detection and size filtering; `n_count8` enables diagonal-aware shape analysis. Many tasks still need: relative positioning between objects, pattern matching within objects, and multi-object spatial relationships.
 
 ### Search pipeline
 

@@ -95,7 +95,7 @@ def simplify(tree, examples, library=None, passes=1):
     R, C = ("r",), ("c",)
     replacements = [
         R, C, ("max_r",), ("max_c",), ("inp_r",), ("inp_c",), ("mode_color",),
-        ("obj_count",), ("max_obj_size",), ("obj8_count",), ("max_obj8_size",),
+        ("obj_count",), ("max_obj_size",),
         IDENTITY, ("get", C, R),
         ("inp", ("r",), ("c",)),                                   # inp(r,c)
         ("sub", ("sub", ("max_r",), ("const", 1)), R),
@@ -409,41 +409,6 @@ def make_seeds():
     seeds.append((("if", ("eq", ("obj_right", R, C), ("sub", MC, ONE)),
                    ("const", 0), ("get", R, C)), 1))
 
-    # ── 8-connectivity object seeds ──────────────────────────────────────
-    # Mirror key obj seeds with obj8 variants for diagonal connectivity
-    # Keep largest 8-connected object
-    seeds.append((("if", ("eq", ("obj8_size", R, C), ("max_obj8_size",)),
-                   ("get", R, C), ("const", 0)), 1))
-    # Remove largest 8-connected object
-    seeds.append((("if", ("eq", ("obj8_size", R, C), ("max_obj8_size",)),
-                   ("const", 0), ("get", R, C)), 1))
-    # Keep 8-connected objects of size N (N=1..5)
-    for n in range(1, 6):
-        seeds.append((("if", ("eq", ("obj8_size", R, C), ("const", n)),
-                       ("get", R, C), ("const", 0)), 1))
-    # Remove isolated pixels (8-conn size==1)
-    seeds.append((("if", ("gt", ("obj8_size", R, C), ("const", 1)),
-                   ("get", R, C), ("const", 0)), 1))
-    # Keep only 8-connected object N (N=1..3)
-    for n in range(1, 4):
-        seeds.append((("if", ("eq", ("obj8_id", R, C), ("const", n)),
-                       ("get", R, C), ("const", 0)), 1))
-    # Recolor all 8-connected objects to single color
-    for color in range(1, 5):
-        seeds.append((("if", ("obj8_id", R, C), ("const", color), ("const", 0)), 1))
-    # Keep 8-connected objects of specific color
-    for color in range(1, 6):
-        seeds.append((("if", ("eq", ("obj8_color", R, C), ("const", color)),
-                       ("get", R, C), ("const", 0)), 1))
-        seeds.append((("if", ("eq", ("obj8_color", R, C), ("const", color)),
-                       ("const", 0), ("get", R, C)), 1))
-    # Size thresholding (8-conn)
-    for n in range(2, 6):
-        seeds.append((("if", ("gt", ("obj8_size", R, C), ("const", n)),
-                       ("get", R, C), ("const", 0)), 1))
-    # Fill bounding box of each 8-connected object with its color
-    seeds.append((("if", ("obj8_id", R, C), ("obj8_color", R, C), ("const", 0)), 1))
-
     # ── n_count8 (8-directional neighbor) seeds ──────────────────────────
     # Edge detection with 8-connectivity: cells with <8 same-color neighbors
     seeds.append((("if", ("gt", ("const", 8), ("n_count8", R, C, ("get", R, C))),
@@ -593,7 +558,7 @@ def refine(tree, examples, library=None, passes=1):
     """Try all single-node edits of tree."""
     best_t, best_f = tree, fitness(tree, examples, library, passes)
     terminals = [("r",), ("c",), ("max_r",), ("max_c",), ("inp_r",), ("inp_c",), ("mode_color",),
-                 ("obj_count",), ("max_obj_size",), ("obj8_count",), ("max_obj8_size",)]
+                 ("obj_count",), ("max_obj_size",)]
     terminals += [("const", i) for i in range(gp.NUM_COLORS)]
     for name in (library or {}):
         terminals.append(("lib", name))
@@ -662,23 +627,22 @@ def refine_wrap(tree, examples, library=None, passes=1):
                         if f > best_f:
                             best_t, best_f = c, f
 
-    # Try wrapping with obj_size conditions (4-conn and 8-conn)
+    # Try wrapping with obj_size conditions
     for fc in changed_from:
         for tv in set(out0[diff].tolist()):
             for sz_thresh in range(1, 6):
                 for cmp_op in ["gt", "eq"]:
-                    for obj_op in ["obj_size", "obj8_size"]:
-                        wrapper = ("if", ("eq", tree, ("const", fc)),
-                                   ("if", (cmp_op, (obj_op, R, C),
-                                           ("const", sz_thresh)),
-                                    ("const", tv), tree),
-                                   tree)
-                        if gp.depth(wrapper) <= gp.MAX_TREE_DEPTH:
-                            if solves(wrapper, examples, library, passes):
-                                return simplify(wrapper, examples, library, passes), 1.0
-                            f = fitness(wrapper, examples, library, passes)
-                            if f > best_f:
-                                best_t, best_f = wrapper, f
+                    wrapper = ("if", ("eq", tree, ("const", fc)),
+                               ("if", (cmp_op, ("obj_size", R, C),
+                                       ("const", sz_thresh)),
+                                ("const", tv), tree),
+                               tree)
+                    if gp.depth(wrapper) <= gp.MAX_TREE_DEPTH:
+                        if solves(wrapper, examples, library, passes):
+                            return simplify(wrapper, examples, library, passes), 1.0
+                        f = fitness(wrapper, examples, library, passes)
+                        if f > best_f:
+                            best_t, best_f = wrapper, f
 
     # Try wrapping with n_count8 conditions
     for fc in changed_from:
@@ -708,8 +672,6 @@ def refine_wrap(tree, examples, library=None, passes=1):
                 ("gt", ("obj_right", R, C), C),    # c < obj_right
                 ("gt", ("obj_size", R, C), ("const", 1)),
                 ("gt", ("obj_size", R, C), ("const", 2)),
-                ("gt", ("obj8_size", R, C), ("const", 1)),
-                ("gt", ("obj8_size", R, C), ("const", 2)),
             ]:
                 wrapped = ("if", cond, node, ("const", 0))
                 c = gp.replace(tree, path, wrapped)
@@ -833,20 +795,6 @@ def error_driven_refine(tree, examples, library=None, passes=1):
         if obj_left_vals is not None:
             conditions.append(("oleft==0", ("eq", ("obj_left", R, C), ("const", 0))))
             conditions.append(("c==oleft", ("eq", C, ("obj_left", R, C))))
-    except Exception:
-        pass
-
-    # Object conditions (8-connectivity)
-    try:
-        obj8_size_vals = gp.evaluate(("obj8_size", R, C), ref["inp"], ref["out"].shape, library)
-        obj8_color_vals = gp.evaluate(("obj8_color", R, C), ref["inp"], ref["out"].shape, library)
-        if obj8_size_vals is not None:
-            for sz in sorted(set(obj8_size_vals[obj8_size_vals > 0].flat))[:5]:
-                conditions.append((f"o8sz=={sz}", ("eq", ("obj8_size", R, C), ("const", int(sz)))))
-                conditions.append((f"o8sz>{sz}", ("gt", ("obj8_size", R, C), ("const", int(sz)))))
-        if obj8_color_vals is not None:
-            for oc in sorted(set(obj8_color_vals[obj8_color_vals > 0].flat))[:5]:
-                conditions.append((f"o8col=={oc}", ("eq", ("obj8_color", R, C), ("const", int(oc)))))
     except Exception:
         pass
 
@@ -1252,51 +1200,6 @@ def task_hypotheses(examples):
                                            TV, ("get", R, C)), 1))
                     # Also try threshold at max_obj_size
                     hypotheses.append((("if", ("eq", ("obj_size", R, C), ("max_obj_size",)),
-                                       TV, ("get", R, C)), 1))
-    except Exception:
-        pass
-
-    # 8. Object-aware hypotheses using 8-connectivity
-    try:
-        import gp as _gp
-        _obj8_size_tree = ("obj8_size", ("r",), ("c",))
-        _sizes8 = _gp.evaluate(_obj8_size_tree, inp0)
-        _obj8_id_tree = ("obj8_id", ("r",), ("c",))
-        _ids8 = _gp.evaluate(_obj8_id_tree, inp0)
-        _obj8_color_tree = ("obj8_color", ("r",), ("c",))
-        _colors8 = _gp.evaluate(_obj8_color_tree, inp0)
-        if _sizes8 is not None and _ids8 is not None:
-            _unique_sizes8 = sorted(set(_sizes8[_sizes8 > 0].tolist()))
-            _unique_ids8 = sorted(set(_ids8[_ids8 > 0].tolist()))
-            for sz in _unique_sizes8[:6]:
-                SZ = ("const", int(sz))
-                hypotheses.append((("if", ("eq", ("obj8_size", R, C), SZ),
-                                   ("get", R, C), ("const", 0)), 1))
-                hypotheses.append((("if", ("eq", ("obj8_size", R, C), SZ),
-                                   ("const", 0), ("get", R, C)), 1))
-            for oid in _unique_ids8[:5]:
-                hypotheses.append((("if", ("eq", ("obj8_id", R, C), ("const", int(oid))),
-                                   ("get", R, C), ("const", 0)), 1))
-            if _colors8 is not None:
-                _unique_obj8_colors = sorted(set(_colors8[_colors8 > 0].tolist()))
-                for oc in _unique_obj8_colors[:5]:
-                    OC = ("const", int(oc))
-                    hypotheses.append((("if", ("eq", ("obj8_color", R, C), OC),
-                                       ("get", R, C), ("const", 0)), 1))
-                    hypotheses.append((("if", ("eq", ("obj8_color", R, C), OC),
-                                       ("const", 0), ("get", R, C)), 1))
-            # Size-based recoloring with 8-connectivity
-            if len(_unique_sizes8) > 1 and inp0.shape == out0.shape:
-                out_colors = set(out0.flat) - {0}
-                for tv in out_colors:
-                    TV = ("const", int(tv))
-                    for sz in _unique_sizes8[:4]:
-                        SZ = ("const", int(sz))
-                        hypotheses.append((("if", ("eq", ("obj8_size", R, C), SZ),
-                                           TV, ("get", R, C)), 1))
-                        hypotheses.append((("if", ("gt", ("obj8_size", R, C), SZ),
-                                           TV, ("get", R, C)), 1))
-                    hypotheses.append((("if", ("eq", ("obj8_size", R, C), ("max_obj8_size",)),
                                        TV, ("get", R, C)), 1))
     except Exception:
         pass
