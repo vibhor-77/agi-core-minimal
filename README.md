@@ -28,7 +28,7 @@ Every program is built from atomic operations plus derived perception layers:
 | **Position** | `r`, `c`, `max_r`, `max_c`, `inp_r`, `inp_c` | Output/input coordinates and dimensions |
 | **Perception** | `get(row, col)`, `inp(row, col)` | Read current/original grid |
 | **Constants** | `0`–`9` | The 10 ARC color values |
-| **Arithmetic** | `add`, `sub`, `mod` | Compute positions (mirror, shift, wrap) |
+| **Arithmetic** | `add`, `sub`, `mod`, `min`, `max_` | Compute positions, distances, clamping |
 | **Logic** | `eq`, `gt`, `if` | Compare values and branch |
 | **Neighborhood** | `n_count(r, c, v)`, `n_count8(r, c, v)` | Count of 4/8-neighbors with color v |
 | **Aggregation** | `row_count(r, v)`, `col_count(c, v)`, `total_count(v)`, `mode_color` | Row/col/global color counts |
@@ -111,12 +111,12 @@ The system avoids hard cutoffs wherever possible:
 
 ### Minimal and universal
 
-The primitive set is deliberately small (20 function ops + 11 terminals) but **universal** — any computable grid transformation can be expressed. The goal is not to add domain-specific primitives but to build a mechanism that discovers useful compositions from atomic operations.
+The primitive set is deliberately small (22 function ops + 11 terminals) but **universal** — any computable grid transformation can be expressed. The goal is not to add domain-specific primitives but to build a mechanism that discovers useful compositions from atomic operations.
 
 ## Current results
 
-- **38/400** training tasks solved (seed sweep + refinement + 1 evolutionary round)
-- 21 library entries abstracted, reused in later solutions
+- **42/400** training tasks solved (seed sweep + refinement + 1 evolutionary round)
+- 29 library entries abstracted, reused in later solutions
 - 125 near-misses (fitness > 0.8) — the system is making partial progress on many tasks
 - Multi-pass programs discovered (2-pass gravity, 3-pass iterative refinement)
 - Object-level primitives: connected component detection enables size-based filtering, object selection
