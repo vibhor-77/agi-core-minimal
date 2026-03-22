@@ -1485,38 +1485,92 @@ def evolve(tasks, rounds, library, tasks_per_round=50):
 # ── Evaluation ───────────────────────────────────────────────────────
 
 def evaluate(tasks, library, train_solvers=None):
-    """Score on held-out test examples."""
+    """Score on held-out test examples using the same pipeline as training."""
     transfer = list({id(v): v for v in (train_solvers or {}).values()}.values())
-    solved_train, solved_test, total = 0, 0, 0
 
+    # Phase 1: seed sweep on all eval tasks (same as training)
+    eval_solved, best_fit = seed_sweep(tasks, library)
+
+    # Phase 1.5: deeper refinement on near-misses
+    refine_count = 0
+    near_misses = [(tid, t, p, f) for tid, (t, p, f) in best_fit.items() if f > 0.7]
+    near_misses.sort(key=lambda x: -x[3])
+    for tid, t, p, f in near_misses[:100]:
+        examples = tasks[tid]["train"]
+        for _ in range(3):
+            t2, f2 = refine(t, examples, library, p)
+            if f2 <= f:
+                break
+            t, f = t2, f2
+            if solves(t, examples, library, p):
+                t = simplify(t, examples, library, p)
+                eval_solved[tid] = (t, p)
+                refine_count += 1
+                break
+        if tid not in eval_solved and f > 0.8:
+            t2, f2 = refine_wrap(t, examples, library, p)
+            if f2 > f:
+                t, f = t2, f2
+                if solves(t, examples, library, p):
+                    t = simplify(t, examples, library, p)
+                    eval_solved[tid] = (t, p)
+                    refine_count += 1
+        if tid not in eval_solved and f > 0.8:
+            t2, f2 = error_driven_refine(t, examples, library, p)
+            if f2 > f:
+                t, f = t2, f2
+                if solves(t, examples, library, p):
+                    t = simplify(t, examples, library, p)
+                    eval_solved[tid] = (t, p)
+                    refine_count += 1
+        if tid not in eval_solved:
+            best_fit[tid] = (t, p, f)
+    if refine_count:
+        print(f"  Eval refinement: +{refine_count} solved")
+
+    # Phase 2: transfer from training solvers
+    transfer_count = 0
     for tid, task in tasks.items():
-        train_ex, test_ex = task["train"], task["test"]
+        if tid in eval_solved:
+            continue
+        for tree, passes in transfer:
+            if solves(tree, task["train"], library, passes):
+                eval_solved[tid] = (tree, passes)
+                transfer_count += 1
+                break
+    if transfer_count:
+        print(f"  Eval transfer: +{transfer_count} solved")
+
+    # Phase 3: evolution on top near-misses
+    tids = [t for t in tasks if t not in eval_solved and t in best_fit]
+    tids.sort(key=lambda t: -best_fit[t][2])
+    new_count = 0
+    transfer_progs = list({id(v): v for v in eval_solved.values()}.values())
+    transfer_progs += transfer
+    for tid in tids[:50]:
+        prev_t, prev_p, prev_f = best_fit[tid]
+        ps, gs = search_budget(prev_f)
+        tree, passes, f = search(tasks[tid]["train"], seed=prev_t,
+                                 seed_passes=prev_p, library=library,
+                                 pop_size=ps, gens=gs,
+                                 transfer=transfer_progs)
+        if solves(tree, tasks[tid]["train"], library, passes):
+            eval_solved[tid] = (tree, passes)
+            new_count += 1
+
+    # Score on held-out test examples
+    solved_train, solved_test = 0, 0
+    total = sum(1 for t in tasks.values() if t["test"])
+    for tid, (tree, passes) in eval_solved.items():
+        test_ex = tasks[tid]["test"]
         if not test_ex:
             continue
-        total += 1
+        solved_train += 1
+        if solves(tree, test_ex, library, passes):
+            solved_test += 1
+            print(f"  ✓ {tid}: {gp.to_str(tree)}")
 
-        # Try direct transfer from training solvers
-        found = False
-        for tree, passes in transfer:
-            if solves(tree, train_ex, library, passes):
-                solved_train += 1
-                if solves(tree, test_ex, library, passes):
-                    solved_test += 1
-                    print(f"  ✓ {tid} (transfer): {gp.to_str(tree)}")
-                found = True
-                break
-        if found:
-            continue
-
-        # Per-task search
-        tree, passes, _ = search(train_ex, library=library)
-        if solves(tree, train_ex, library, passes):
-            solved_train += 1
-            if solves(tree, test_ex, library, passes):
-                solved_test += 1
-                print(f"  ✓ {tid}: {gp.to_str(tree)}")
-
-    print(f"Eval: {solved_test}/{total} test ({solved_train} train)")
+    print(f"Eval: {solved_test}/{total} test ({solved_train} train, +{new_count} evolved)")
     return solved_test
 
 
